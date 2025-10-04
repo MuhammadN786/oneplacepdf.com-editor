@@ -1,31 +1,22 @@
 # app.py — Single-file Flask PDF Editor (PyMuPDF + Bootstrap)
-# New in this version:
-# - Highlight & Strikeout
-# - Shapes: rectangle, circle, line, arrow
-# - Freehand (ink)
-# - Text Box (FreeText)
-# - Signature tool (draw in modal, then place onto page)
-# - Per-page zoom & thumbnails
-# - Client undo/redo (pre-save) + Server rollback (version history)
-# - Local or S3 storage (toggle with USE_S3)
-# - Correct coordinate scaling from screen -> PDF space using viewport info
+# Fixes:
+# - Canvas overlay now receives mouse events (pointer-events: auto + z-index)
+# - Better error handling (alerts when upload/thumb/page/annotate fails)
+# - Signature tool included
+# - Works with Gunicorn or python app.py (respects $PORT)
 
-import io, os, uuid
+import io, os, uuid, base64
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template_string
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-import base64
 import fitz  # PyMuPDF
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "dev-secret")
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB uploads
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = Path(os.getenv("WORK_DIR", BASE_DIR / "work"))
@@ -33,7 +24,6 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXT = {".pdf"}
 
-# Optional S3
 USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
 if USE_S3:
     import boto3
@@ -41,16 +31,10 @@ if USE_S3:
     S3_REGION = os.getenv("S3_REGION")
     s3 = boto3.client("s3", region_name=S3_REGION)
 else:
-    s3 = None
-    S3_BUCKET = None
+    s3, S3_BUCKET = None, None
 
-# In-memory doc index (swap for DB in production)
 DOCS = {}  # {doc_id: {name, original, working, versions[], created}}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Storage Abstraction
-# ──────────────────────────────────────────────────────────────────────────────
 class Storage:
     @staticmethod
     def save(file_bytes: bytes, key: str):
@@ -69,22 +53,16 @@ class Storage:
             return obj["Body"].read()
         return (WORK_DIR / key).read_bytes()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
 def _allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXT
 
 def _color_tuple(rgb_list):
-    # Expect [r,g,b] 0-255; default yellow for highlights
     if not rgb_list:
         return (1.0, 1.0, 0.0)
     r, g, b = [max(0, min(255, int(c))) / 255.0 for c in rgb_list[:3]]
     return (r, g, b)
 
 def _scale_rect(rect, page_rect, viewport):
-    # rect from client pixels -> PDF points
     vx, vy = max(1, int(viewport.get("w", 1))), max(1, int(viewport.get("h", 1)))
     sx, sy = page_rect.width / vx, page_rect.height / vy
     x0, y0, x1, y1 = rect
@@ -96,16 +74,18 @@ def _scale_point(pt, page_rect, viewport):
     return fitz.Point(pt[0] * sx, pt[1] * sy)
 
 def _decode_data_url(data_url: str) -> bytes:
-    # data:image/png;base64,AAAA...
     if not data_url or "," not in data_url:
         return b""
-    header, b64 = data_url.split(",", 1)
+    _, b64 = data_url.split(",", 1)
     return base64.b64decode(b64)
 
+# Slightly reduce caching of images so page refresh shows latest version
+@app.after_request
+def add_no_cache(resp):
+    if request.path.startswith(("/thumb/", "/page/")):
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Routes
-# ──────────────────────────────────────────────────────────────────────────────
 INDEX_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -118,12 +98,12 @@ INDEX_HTML = r"""
     body { background:#0b1020; color:#e7ecff; }
     .toolbar .btn { border-radius:999px; }
     #thumbs { max-height:80vh; overflow:auto; }
-    #canvasWrap { position:relative; background:#fff; padding:0; }
-    #overlay { position:absolute; left:0; top:0; pointer-events:none; }
+    #canvasWrap { position:relative; background:#101425; padding:0; min-height:60vh; }
+    #pageImg { display:block; max-width:100%; height:auto; position:relative; z-index:1; }
+    #overlay { position:absolute; left:0; top:0; pointer-events:auto; z-index:2; } /* FIX: receive events */
     .tool-active { outline:2px solid #6ea8fe; }
-    img.page { display:block; max-width:100%; height:auto; }
-    #sigPad { background:#fff; border:1px dashed #888; touch-action:none; }
     .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#11162a; border:1px solid #2a355d; border-radius:6px; padding:1px 6px; }
+    .card.bg-dark { background:#0f1428 !important; }
   </style>
 </head>
 <body>
@@ -141,19 +121,17 @@ INDEX_HTML = r"""
         <div class="card-header">Pages</div>
         <div class="card-body" id="thumbs"></div>
       </div>
-
       <div class="small mt-3">
-        <div class="mb-2">Shortcuts:
-          <span class="kbd">H</span> Highlight,
-          <span class="kbd">S</span> Strike,
-          <span class="kbd">R</span> Rect,
-          <span class="kbd">C</span> Circle,
-          <span class="kbd">L</span> Line,
-          <span class="kbd">A</span> Arrow,
-          <span class="kbd">I</span> Ink,
-          <span class="kbd">T</span> Text,
-          <span class="kbd">G</span> Signature
-        </div>
+        Shortcuts:
+        <span class="kbd">H</span> Highlight,
+        <span class="kbd">S</span> Strike,
+        <span class="kbd">R</span> Rect,
+        <span class="kbd">C</span> Circle,
+        <span class="kbd">L</span> Line,
+        <span class="kbd">A</span> Arrow,
+        <span class="kbd">I</span> Ink,
+        <span class="kbd">T</span> Text,
+        <span class="kbd">G</span> Signature
       </div>
     </div>
 
@@ -186,7 +164,7 @@ INDEX_HTML = r"""
       </div>
 
       <div id="canvasWrap" class="rounded-3 shadow">
-        <img id="pageImg" class="page" src="" />
+        <img id="pageImg" src="" />
         <canvas id="overlay"></canvas>
       </div>
     </div>
@@ -202,13 +180,12 @@ INDEX_HTML = r"""
         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
-        <canvas id="sigPad" width="500" height="180"></canvas>
+        <canvas id="sigPad" width="500" height="180" style="background:#fff;border:1px dashed #888;touch-action:none;"></canvas>
         <div class="d-flex gap-2 mt-2">
           <button id="sigClear" class="btn btn-outline-light">Clear</button>
           <button id="sigUse" class="btn btn-success" data-bs-dismiss="modal">Use Signature</button>
           <div class="ms-auto small text-secondary" id="sigStatus">Not set</div>
         </div>
-        <div class="small text-secondary mt-2">Tip: draw with mouse or finger (on touch).</div>
       </div>
     </div>
   </div>
@@ -216,19 +193,12 @@ INDEX_HTML = r"""
 
 <script>
 (() => {
-  let docId = null;
-  let currentPage = 0;
-  let totalPages = 0;
-  let zoom = 1.2;
+  let docId = null, currentPage = 0, totalPages = 0, zoom = 1.2;
 
   const state = {
-    tool: null,
-    color: '#ffeb3b',
-    thickness: 2,
-    stack: [],  // local actions (pending save)
-    redo: [],
-    drawing: false,
-    stroke: [],
+    tool: null, color: '#ffeb3b', thickness: 2,
+    stack: [], redo: [],
+    drawing: false, stroke: [],
     signatureDataURL: null,
   };
 
@@ -244,119 +214,122 @@ INDEX_HTML = r"""
     });
   });
 
-  // Keyboard shortcuts
+  // Shortcuts
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
-    const toolMap = { h:'highlight', s:'strikeout', r:'rect', c:'circle', l:'line', a:'arrow', i:'ink', t:'textbox', g:'signature' };
-    if (toolMap[k]) {
-      const target = document.querySelector(`[data-tool="${toolMap[k]}"]`);
-      if (target) target.click();
-    }
-    if ((e.ctrlKey || e.metaKey) && k === 'z') el('btnUndo').click();
-    if ((e.ctrlKey || e.metaKey) && k === 'y') el('btnRedo').click();
+    const map = { h:'highlight', s:'strikeout', r:'rect', c:'circle', l:'line', a:'arrow', i:'ink', t:'textbox', g:'signature' };
+    if (map[k]) document.querySelector(`[data-tool="${map[k]}"]`)?.click();
+    if ((e.ctrlKey||e.metaKey) && k==='z') el('btnUndo').click();
+    if ((e.ctrlKey||e.metaKey) && k==='y') el('btnRedo').click();
   });
 
-  el('color').addEventListener('input', (e) => state.color = e.target.value);
-  el('thickness').addEventListener('input', (e) => state.thickness = parseInt(e.target.value));
-  el('zoom').addEventListener('input', (e) => { zoom = parseFloat(e.target.value); renderPage(); });
+  el('color').addEventListener('input', e => state.color = e.target.value);
+  el('thickness').addEventListener('input', e => state.thickness = +e.target.value);
+  el('zoom').addEventListener('input', e => { zoom = +e.target.value; renderPage(); });
 
   el('file').addEventListener('change', async (e) => {
     const f = e.target.files[0];
     if (!f) return;
-    const fd = new FormData();
-    fd.append('file', f);
-    const r = await fetch('/upload', { method: 'POST', body: fd });
-    const j = await r.json();
-    if (!r.ok) return alert(j.error || 'Upload failed');
-    docId = j.doc_id;
-    await loadThumbs();
-    await renderPage(0);
+    try {
+      const fd = new FormData(); fd.append('file', f);
+      const r = await fetch('/upload', { method: 'POST', body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'Upload failed');
+      docId = j.doc_id;
+      await loadThumbs();
+      await renderPage(0);
+    } catch (err) {
+      alert('Upload error: ' + err.message);
+      console.error(err);
+    }
   });
 
-  el('btnDownload').addEventListener('click', () => {
-    if (!docId) return;
-    window.location.href = '/download/' + docId;
-  });
+  el('btnDownload').addEventListener('click', () => { if (docId) window.location.href = '/download/' + docId; });
 
   el('btnUndoServer').addEventListener('click', async () => {
     if (!docId) return;
-    const r = await fetch('/revert/' + docId, { method: 'POST' });
-    const j = await r.json();
-    if (!j.ok) return alert(j.error || 'Rollback failed');
-    state.stack = [];
-    state.redo = [];
-    await renderPage();
+    try {
+      const r = await fetch('/revert/' + docId, { method: 'POST' });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'Rollback failed');
+      state.stack = []; state.redo = [];
+      await renderPage();
+    } catch (err) {
+      alert('Rollback error: ' + err.message);
+      console.error(err);
+    }
   });
 
-  el('btnUndo').addEventListener('click', () => {
-    if (!state.stack.length) return;
-    state.redo.push(state.stack.pop());
-    redrawOverlay();
-  });
-
-  el('btnRedo').addEventListener('click', () => {
-    if (!state.redo.length) return;
-    state.stack.push(state.redo.pop());
-    redrawOverlay();
-  });
+  el('btnUndo').addEventListener('click', () => { if (state.stack.length) { state.redo.push(state.stack.pop()); redrawOverlay(); } });
+  el('btnRedo').addEventListener('click', () => { if (state.redo.length) { state.stack.push(state.redo.pop()); redrawOverlay(); } });
 
   el('btnSave').addEventListener('click', async () => {
     if (!docId || !state.stack.length) return;
-    // Attach viewport for coordinate scaling
-    const viewport = { w: overlay.width, h: overlay.height };
-    const payload = {
-      actions: state.stack.map(a => ({ ...a, viewport })),
-    };
-    const r = await fetch('/annotate/' + docId, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const j = await r.json();
-    if (!j.ok) return alert(j.error || 'Save failed');
-    state.stack = [];
-    state.redo = [];
-    await renderPage();
+    try {
+      const viewport = { w: overlay.width, h: overlay.height };
+      const payload = { actions: state.stack.map(a => ({ ...a, viewport })) };
+      const r = await fetch('/annotate/' + docId, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'Save failed');
+      state.stack = []; state.redo = [];
+      await renderPage();
+    } catch (err) {
+      alert('Save error: ' + err.message);
+      console.error(err);
+    }
   });
 
-  // Thumbs
   async function loadThumbs() {
-    const r = await fetch('/thumbs/' + docId);
-    const j = await r.json();
-    if (!r.ok) return alert(j.error || 'Thumbs failed');
-    totalPages = j.pages;
-    const wrap = el('thumbs');
-    wrap.innerHTML = '';
-    for (let i = 0; i < totalPages; i++) {
-      const img = document.createElement('img');
-      img.src = `/thumb/${docId}/${i}`;
-      img.className = 'img-fluid mb-2 rounded';
-      img.style.cursor = 'pointer';
-      img.addEventListener('click', () => renderPage(i));
-      wrap.appendChild(img);
+    try {
+      const r = await fetch('/thumbs/' + docId);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'Thumbs failed');
+      totalPages = j.pages;
+      const wrap = el('thumbs'); wrap.innerHTML = '';
+      for (let i = 0; i < totalPages; i++) {
+        const img = document.createElement('img');
+        img.src = `/thumb/${docId}/${i}`;
+        img.className = 'img-fluid mb-2 rounded';
+        img.style.cursor = 'pointer';
+        img.addEventListener('click', () => renderPage(i));
+        wrap.appendChild(img);
+      }
+    } catch (err) {
+      alert('Thumbs error: ' + err.message);
+      console.error(err);
     }
   }
 
-  const pageImg = el('pageImg');
-  const overlay = el('overlay');
+  const pageImg = el('pageImg'), overlay = el('overlay');
 
   function syncOverlaySize() {
-    overlay.width = pageImg.clientWidth;
-    overlay.height = pageImg.clientHeight;
-    overlay.style.width = pageImg.clientWidth + 'px';
-    overlay.style.height = pageImg.clientHeight + 'px';
-    overlay.style.left = pageImg.offsetLeft + 'px';
-    overlay.style.top = pageImg.offsetTop + 'px';
+    // Align overlay with the displayed image
+    overlay.width = pageImg.clientWidth || overlay.width;
+    overlay.height = pageImg.clientHeight || overlay.height;
+    overlay.style.width = overlay.width + 'px';
+    overlay.style.height = overlay.height + 'px';
+    overlay.style.left = '0px';
+    overlay.style.top = '0px';
   }
   window.addEventListener('resize', syncOverlaySize);
 
   async function renderPage(p = currentPage) {
     if (docId == null) return;
     currentPage = p;
-    pageImg.src = `/page/${docId}/${currentPage}?zoom=${zoom}`;
-    await new Promise((res) => pageImg.onload = res);
-    syncOverlaySize();
-    redrawOverlay();
+    try {
+      pageImg.src = `/page/${docId}/${currentPage}?zoom=${zoom}`;
+      await new Promise((res, rej) => {
+        pageImg.onload = () => res();
+        pageImg.onerror = () => rej(new Error('Failed to load page image'));
+      });
+      syncOverlaySize();
+      redrawOverlay();
+    } catch (err) {
+      alert('Render page error: ' + err.message);
+      console.error(err);
+    }
   }
 
   function hexToRgb(hex) {
@@ -367,44 +340,29 @@ INDEX_HTML = r"""
   function redrawOverlay() {
     const ctx = overlay.getContext('2d');
     ctx.clearRect(0,0,overlay.width, overlay.height);
-    for (const a of state.stack) {
-      if (a.page !== currentPage) continue;
-      drawLocal(ctx, a);
-    }
+    for (const a of state.stack) if (a.page === currentPage) drawLocal(ctx, a);
     if (state.drawing && state.tool === 'ink' && state.stroke.length) {
-      ctx.lineWidth = state.thickness;
-      ctx.strokeStyle = state.color;
-      ctx.beginPath();
-      ctx.moveTo(state.stroke[0][0], state.stroke[0][1]);
+      ctx.lineWidth = state.thickness; ctx.strokeStyle = state.color;
+      ctx.beginPath(); ctx.moveTo(state.stroke[0][0], state.stroke[0][1]);
       for (let i=1; i<state.stroke.length; i++) ctx.lineTo(state.stroke[i][0], state.stroke[i][1]);
       ctx.stroke();
     }
   }
 
   function drawLocal(ctx, a) {
-    ctx.save();
-    ctx.strokeStyle = a.colorHex || '#000';
-    ctx.lineWidth = a.thickness || 2;
-
+    ctx.save(); ctx.strokeStyle = a.colorHex || '#000'; ctx.lineWidth = a.thickness || 2;
     if (a.type === 'highlight' || a.type === 'strikeout') {
-      const r = a.rect;
-      ctx.globalAlpha = a.opacity || (a.type==='highlight' ? 0.35 : 0.25);
-      ctx.fillStyle = a.colorHex || '#ff0';
-      ctx.fillRect(r[0], r[1], r[2]-r[0], r[3]-r[1]);
-      ctx.globalAlpha = 1.0;
-
+      const r = a.rect; ctx.globalAlpha = a.opacity || (a.type==='highlight' ? 0.35 : 0.25);
+      ctx.fillStyle = a.colorHex || '#ff0'; ctx.fillRect(r[0], r[1], r[2]-r[0], r[3]-r[1]); ctx.globalAlpha = 1.0;
     } else if (a.type === 'shape_rect') {
       const r = a.rect; ctx.strokeRect(r[0], r[1], r[2]-r[0], r[3]-r[1]);
-
     } else if (a.type === 'shape_circle') {
       const r = a.rect; const cx=(r[0]+r[2])/2, cy=(r[1]+r[3])/2; const rx=(r[2]-r[0])/2, ry=(r[3]-r[1])/2;
       ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.stroke();
-
     } else if (a.type === 'line' || a.type === 'arrow') {
       const [p1,p2] = a.points; ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
       if (a.type === 'arrow') {
-        const ang = Math.atan2(p2[1]-p1[1], p2[0]-p1[0]);
-        const len = 10 + (a.thickness||2)*1.5;
+        const ang = Math.atan2(p2[1]-p1[1], p2[0]-p1[0]), len = 10 + (a.thickness||2)*1.5;
         ctx.beginPath();
         ctx.moveTo(p2[0], p2[1]);
         ctx.lineTo(p2[0]-len*Math.cos(ang-0.4), p2[1]-len*Math.sin(ang-0.4));
@@ -412,12 +370,10 @@ INDEX_HTML = r"""
         ctx.lineTo(p2[0]-len*Math.cos(ang+0.4), p2[1]-len*Math.sin(ang+0.4));
         ctx.stroke();
       }
-
     } else if (a.type === 'textbox') {
       const r = a.rect; ctx.strokeRect(r[0],r[1],r[2]-r[0],r[3]-r[1]);
       ctx.font = `${a.font_size||14}px Arial`; ctx.fillStyle = a.colorHex || '#000';
       wrapText(ctx, a.text||'', r[0]+4, r[1]+16, (r[2]-r[0])-8, (a.font_size||14)+4);
-
     } else if (a.type === 'ink') {
       for (const stroke of a.points) {
         if (!stroke.length) continue;
@@ -425,82 +381,50 @@ INDEX_HTML = r"""
         for (let i=1; i<stroke.length; i++) ctx.lineTo(stroke[i][0], stroke[i][1]);
         ctx.stroke();
       }
-
     } else if (a.type === 'signature' && a.previewDataURL) {
-      const r = a.rect;
-      const img = new Image();
-      img.onload = () => { ctx.drawImage(img, r[0], r[1], r[2]-r[0], r[3]-r[1]); };
+      const r = a.rect; const img = new Image();
+      img.onload = () => ctx.drawImage(img, r[0], r[1], r[2]-r[0], r[3]-r[1]);
       img.src = a.previewDataURL;
     }
-
     ctx.restore();
   }
 
   function wrapText(ctx, text, x, y, maxWidth, lineHeight) {
-    const words = text.split(' ');
-    let line = '';
+    const words = text.split(' '); let line = '';
     for (let n = 0; n < words.length; n++) {
-      const testLine = line + words[n] + ' ';
-      const testWidth = ctx.measureText(testLine).width;
-      if (testWidth > maxWidth && n > 0) {
-        ctx.fillText(line, x, y);
-        line = words[n] + ' ';
-        y += lineHeight;
-      } else {
-        line = testLine;
-      }
+      const testLine = line + words[n] + ' '; const testWidth = ctx.measureText(testLine).width;
+      if (testWidth > maxWidth && n > 0) { ctx.fillText(line, x, y); line = words[n] + ' '; y += lineHeight; }
+      else { line = testLine; }
     }
     ctx.fillText(line, x, y);
   }
 
-  // Overlay interactions
-  const overlay = el('overlay');
-  const wrap = document.getElementById('canvasWrap');
-  let start = null;
+  const overlay = document.getElementById('overlay');
 
+  let start = null;
   overlay.addEventListener('mousedown', (e) => {
     if (!state.tool) return;
-    state.drawing = true;
-    const {x,y} = rel(e);
-    start = [x,y];
+    state.drawing = true; const {x,y} = rel(e); start = [x,y];
     if (state.tool === 'ink') state.stroke = [[x,y]];
-    overlay.style.pointerEvents = 'auto';
   });
-
   overlay.addEventListener('mousemove', (e) => {
     if (!state.drawing) return;
     const {x,y} = rel(e);
-    if (state.tool === 'ink') {
-      state.stroke.push([x,y]);
-      redrawOverlay();
-      return;
-    }
+    if (state.tool === 'ink') { state.stroke.push([x,y]); redrawOverlay(); return; }
     redrawOverlay();
     const ctx = overlay.getContext('2d');
     drawLocal(ctx, previewAction(start, [x,y], true));
   });
-
   overlay.addEventListener('mouseup', (e) => {
     if (!state.drawing) return;
-    state.drawing = false;
-    overlay.style.pointerEvents = 'none';
-    const {x,y} = rel(e);
+    state.drawing = false; const {x,y} = rel(e);
     if (state.tool === 'ink') {
-      const action = {
-        type: 'ink', page: currentPage,
-        points: [state.stroke],
-        color: hexToRgb(state.color), colorHex: state.color,
-        thickness: state.thickness,
-      };
-      state.stack.push(action); state.redo = [];
-      redrawOverlay();
-      state.stroke = [];
-      return;
+      state.stack.push({ type:'ink', page: currentPage, points:[state.stroke], color:hexToRgb(state.color), colorHex:state.color, thickness:state.thickness });
+      state.redo = []; redrawOverlay(); state.stroke = []; return;
     }
     const a = previewAction(start, [x,y], false);
-    if (!a) return; // e.g. signature requested but not set
-    state.stack.push(a); state.redo = [];
-    redrawOverlay();
+    if (!a) return;
+    state.stack.push(a); state.redo = []; redrawOverlay();
   });
 
   function rel(e) {
@@ -518,39 +442,26 @@ INDEX_HTML = r"""
     if (state.tool === 'rect') return { ...base, type:'shape_rect', rect };
     if (state.tool === 'circle') return { ...base, type:'shape_circle', rect };
     if (state.tool === 'textbox') {
-      const text = forPreview ? ('' ) : (prompt('Text content?') || '');
+      const text = forPreview ? '' : (prompt('Text content?') || '');
       return { ...base, type:'textbox', rect, font_size:14, text };
     }
-    if (state.tool === 'line' || state.tool === 'arrow') {
-      return { ...base, type: state.tool, points: [p1, p2] };
-    }
+    if (state.tool === 'line' || state.tool === 'arrow') return { ...base, type: state.tool, points: [p1, p2] };
     if (state.tool === 'signature') {
-      if (!state.signatureDataURL) {
-        if (!forPreview) alert('Open Signature and draw your signature first.');
-        return null;
-      }
+      if (!state.signatureDataURL) { if (!forPreview) alert('Open Signature and draw your signature first.'); return null; }
       return { ...base, type:'signature', rect, previewDataURL: state.signatureDataURL, image_data_url: state.signatureDataURL };
     }
     return base;
   }
 
   // Signature pad
-  const sigPad = el('sigPad');
+  const sigPad = document.getElementById('sigPad');
   const sigCtx = sigPad.getContext('2d');
   sigCtx.lineWidth = 2; sigCtx.lineCap = 'round'; sigCtx.strokeStyle = '#111';
   let sigDraw = false, last = null;
 
-  function sigPos(e) {
-    const r = sigPad.getBoundingClientRect();
-    if (e.touches && e.touches[0]) e = e.touches[0];
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
-  }
+  function sigPos(e) { const r = sigPad.getBoundingClientRect(); const t = e.touches?.[0] || e; return { x: t.clientX - r.left, y: t.clientY - r.top }; }
   function sigStart(e){ sigDraw = true; last = sigPos(e); e.preventDefault(); }
-  function sigMove(e){
-    if (!sigDraw) return; const p = sigPos(e);
-    sigCtx.beginPath(); sigCtx.moveTo(last.x, last.y); sigCtx.lineTo(p.x, p.y); sigCtx.stroke();
-    last = p; e.preventDefault();
-  }
+  function sigMove(e){ if (!sigDraw) return; const p = sigPos(e); sigCtx.beginPath(); sigCtx.moveTo(last.x,last.y); sigCtx.lineTo(p.x,p.y); sigCtx.stroke(); last = p; e.preventDefault(); }
   function sigEnd(){ sigDraw = false; }
 
   sigPad.addEventListener('mousedown', sigStart);
@@ -560,14 +471,14 @@ INDEX_HTML = r"""
   sigPad.addEventListener('touchmove', sigMove, {passive:false});
   sigPad.addEventListener('touchend', sigEnd);
 
-  el('sigClear').addEventListener('click', () => {
+  document.getElementById('sigClear').addEventListener('click', () => {
     sigCtx.clearRect(0,0,sigPad.width, sigPad.height);
-    el('sigStatus').textContent = 'Not set';
+    document.getElementById('sigStatus').textContent = 'Not set';
     state.signatureDataURL = null;
   });
-  el('sigUse').addEventListener('click', () => {
+  document.getElementById('sigUse').addEventListener('click', () => {
     state.signatureDataURL = sigPad.toDataURL('image/png');
-    el('sigStatus').textContent = 'Signature saved';
+    document.getElementById('sigStatus').textContent = 'Signature saved';
   });
 
 })();
@@ -693,9 +604,7 @@ def annotate(doc_id):
             annot.update()
 
         elif t == "ink":
-            strokes = []
-            for stroke in a["points"]:
-                strokes.append([_scale_point(pt, page_rect, viewport) for pt in stroke])
+            strokes = [[_scale_point(pt, page_rect, viewport) for pt in stroke] for stroke in a["points"]]
             annot = page.add_ink_annot(strokes)
             annot.set_colors(stroke=_color_tuple(a.get("color")))
             annot.set_border(width=float(a.get("thickness", 2)))
@@ -713,13 +622,10 @@ def annotate(doc_id):
             annot.update()
 
         elif t == "signature":
-            # image_data_url (PNG) + rect
             rect = _scale_rect(a["rect"], page_rect, viewport)
             img_bytes = _decode_data_url(a.get("image_data_url"))
             if img_bytes:
                 page.insert_image(rect, stream=img_bytes, keep_proportion=True)
-
-        # (Extend here: watermark_text / stamp_image / form_fill if needed.)
 
     out = io.BytesIO()
     pdf.save(out)
@@ -737,7 +643,7 @@ def revert(doc_id):
     vers = DOCS[doc_id]["versions"]
     if len(vers) < 2:
         return jsonify({"error": "no previous version"}), 400
-    vers.pop()  # drop current
+    vers.pop()
     DOCS[doc_id]["working"] = vers[-1]
     return jsonify({"ok": True, "version": len(vers)})
 
@@ -753,9 +659,6 @@ def download(doc_id):
 def health():
     return jsonify({"ok": True})
 
-# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Run: python app.py
-    # On Render / Heroku, set Start Command to "gunicorn app:app --bind 0.0.0.0:$PORT"
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)

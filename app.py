@@ -1,15 +1,8 @@
 # app.py — Single-file Flask PDF Editor (PyMuPDF + Bootstrap)
-# Works end-to-end: upload → thumbnails → render → annotate → save → download
-# Fix: removed duplicate JS const for `overlay` that caused a parse error.
-# Features: highlight, strikeout, rectangle, circle, line, arrow, ink, textbox, signature,
-# zoom, thumbnails, undo/redo, server rollback, local or S3 storage.
-#
-# requirements.txt (minimum):
-# Flask==3.0.3
-# python-dotenv==1.0.1
-# PyMuPDF==1.24.6
-# gunicorn==22.0.0        # (recommended on Render/Heroku)
-# boto3==1.34.162         # (only if USE_S3=true)
+# Fix: Signature tool can be selected and auto-activates after “Use Signature”
+#      so you can click-drag on the page to place the signature.
+# Also includes: highlight, strikeout, shapes, line/arrow, ink, textbox, thumbnails,
+# zoom, undo/redo, rollback, local or S3 storage.
 
 import io, os, uuid, base64
 from datetime import datetime
@@ -19,7 +12,7 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
-# ───────────────────────────── Config ─────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "dev-secret")
@@ -42,7 +35,7 @@ else:
 
 DOCS = {}  # {doc_id: {name, original, working, versions[], created}}
 
-# ─────────────────────── Storage Abstraction ──────────────────────
+# ── Storage ───────────────────────────────────────────────────────────────────
 class Storage:
     @staticmethod
     def save(file_bytes: bytes, key: str) -> str:
@@ -64,7 +57,7 @@ class Storage:
             p = WORK_DIR / key
         return p.read_bytes()
 
-# ───────────────────────────── Helpers ────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXT
 
@@ -91,14 +84,13 @@ def _decode_data_url(data_url: str) -> bytes:
     _, b64 = data_url.split(",", 1)
     return base64.b64decode(b64)
 
-# Avoid caching thumbs/pages so new versions show right away
 @app.after_request
 def add_no_cache(resp):
     if request.path.startswith(("/thumb/", "/page/")):
         resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
-# ─────────────────────────── UI (inline) ─────────────────────────
+# ── UI (inline HTML/JS) ───────────────────────────────────────────────────────
 INDEX_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -159,7 +151,8 @@ INDEX_HTML = r"""
           <button class="btn btn-light" data-tool="arrow">Arrow</button>
           <button class="btn btn-light" data-tool="ink">Freehand</button>
           <button class="btn btn-light" data-tool="textbox">Text Box</button>
-          <button class="btn btn-warning" id="btnSignature" data-bs-toggle="modal" data-bs-target="#signatureModal">Signature</button>
+          <!-- Signature acts as a tool AND opens the pad -->
+          <button class="btn btn-warning" data-tool="signature" id="btnSignature" data-bs-toggle="modal" data-bs-target="#signatureModal">Signature</button>
 
           <div class="vr"></div>
           <label class="text-nowrap">Color</label>
@@ -199,6 +192,7 @@ INDEX_HTML = r"""
           <button id="sigUse" class="btn btn-success" data-bs-dismiss="modal">Use Signature</button>
           <div class="ms-auto small text-secondary" id="sigStatus">Not set</div>
         </div>
+        <div class="small text-secondary mt-2">After “Use Signature”, drag on the page to place it.</div>
       </div>
     </div>
   </div>
@@ -206,7 +200,6 @@ INDEX_HTML = r"""
 
 <script>
 (() => {
-  // Simple global error hook to surface any script issues
   window.addEventListener('error', (e) => console.error('JS error:', e.message));
 
   let docId = null, currentPage = 0, totalPages = 0, zoom = 1.2;
@@ -221,11 +214,11 @@ INDEX_HTML = r"""
   const el = (id) => document.getElementById(id);
   const toolbarBtns = [...document.querySelectorAll('[data-tool]')];
 
-  // Elements (NOTE: only one declaration of `overlay`)
+  // Elements
   const pageImg = el('pageImg');
   const overlay = el('overlay');
 
-  // Tool buttons
+  // Tool buttons (Signature included)
   toolbarBtns.forEach((b) => {
     b.addEventListener('click', () => {
       toolbarBtns.forEach((x) => x.classList.remove('tool-active'));
@@ -234,7 +227,7 @@ INDEX_HTML = r"""
     });
   });
 
-  // Keyboard shortcuts
+  // Shortcuts
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     const map = { h:'highlight', s:'strikeout', r:'rect', c:'circle', l:'line', a:'arrow', i:'ink', t:'textbox', g:'signature' };
@@ -475,9 +468,15 @@ INDEX_HTML = r"""
     document.getElementById('sigStatus').textContent = 'Not set';
     state.signatureDataURL = null;
   });
+
+  // After saving the signature: store data AND activate the signature tool
   document.getElementById('sigUse').addEventListener('click', () => {
     state.signatureDataURL = sigPad.toDataURL('image/png');
     document.getElementById('sigStatus').textContent = 'Signature saved';
+    // Activate signature tool so user can place it on the page
+    state.tool = 'signature';
+    toolbarBtns.forEach((x) => x.classList.remove('tool-active'));
+    document.querySelector('[data-tool="signature"]')?.classList.add('tool-active');
   });
 
 })();
@@ -487,7 +486,7 @@ INDEX_HTML = r"""
 </html>
 """
 
-# ───────────────────────────── Routes ────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def index():
     return render_template_string(INDEX_HTML)
@@ -662,7 +661,6 @@ def download(doc_id):
 def health():
     return jsonify({"ok": True})
 
-# ───────────────────────────── Entrypoint ─────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+  port = int(os.environ.get("PORT", "8000"))
+  app.run(host="0.0.0.0", port=port, debug=False)

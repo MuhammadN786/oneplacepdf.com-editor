@@ -1,7 +1,10 @@
-# app.py — Single-file Flask Mini PDF Editor with Annotations (PyMuPDF + Bootstrap)
-# Features: upload, per-page PNG render (zoom), thumbnails, highlight, strikeout, shapes (rect/circle/line/arrow*),
-# freehand ink, text boxes, client undo/redo (pre-save), server rollback (version history), download, optional S3 storage.
-# *Arrowheads best-effort (PyMuPDF line ends; safely ignored if not supported in your version).
+# app.py — Single-file Flask Mini PDF Editor (PyMuPDF + Bootstrap)
+# Now includes: Signature tool (draw/upload), Highlight, Strikeout, Shapes, Arrow/Line,
+# Freehand Ink, Text Box, Per-page Zoom, Thumbnails, Client Undo/Redo, Server Rollback,
+# Download, Optional S3 storage. Ready for Render / Gunicorn.
+#
+# Start locally:  python app.py  -> http://localhost:8000
+# Render Start Command (recommended): gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
 
 import io, os, uuid
 from datetime import datetime
@@ -17,6 +20,7 @@ import fitz  # PyMuPDF
 load_dotenv()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "dev-secret")
+# app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # optional: 100MB
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = Path(os.getenv("WORK_DIR", BASE_DIR / "work"))
@@ -68,7 +72,7 @@ def _allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXT
 
 def _color_tuple(rgb_list):
-    # Expect [r,g,b] 0-255; default yellow for highlights
+    # Expect [r,g,b] 0-255; default yellow (highlight)
     if not rgb_list:
         return (1.0, 1.0, 0.0)
     r, g, b = [max(0, min(255, int(c))) / 255.0 for c in rgb_list[:3]]
@@ -76,7 +80,7 @@ def _color_tuple(rgb_list):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Routes
+# Inline Frontend (Bootstrap + Canvas overlay + Signature modal)
 # ──────────────────────────────────────────────────────────────────────────────
 INDEX_HTML = r"""
 <!doctype html>
@@ -84,16 +88,18 @@ INDEX_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mini PDF Editor — Annotations</title>
+  <title>Mini PDF Editor — Annotations + Signature</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
   <style>
     body { background:#0b1020; color:#e7ecff; }
     .toolbar .btn { border-radius:999px; }
     #thumbs { max-height:80vh; overflow:auto; }
-    #canvasWrap { position:relative; background:#fff; padding:0; }
+    #canvasWrap { position:relative; background:#fff; }
     #overlay { position:absolute; left:0; top:0; pointer-events:none; }
     .tool-active { outline:2px solid #6ea8fe; }
     img.page { display:block; max-width:100%; height:auto; }
+    /* Signature Modal */
+    .sig-canvas { background:#fff; border:1px dashed #999; border-radius:8px; touch-action:none; }
   </style>
 </head>
 <body>
@@ -124,6 +130,7 @@ INDEX_HTML = r"""
           <button class="btn btn-light" data-tool="line">Line</button>
           <button class="btn btn-light" data-tool="ink">Freehand</button>
           <button class="btn btn-light" data-tool="textbox">Text Box</button>
+          <button class="btn btn-primary" data-tool="signature">Signature</button>
 
           <div class="vr"></div>
           <label class="text-nowrap">Color</label>
@@ -131,7 +138,7 @@ INDEX_HTML = r"""
           <label class="text-nowrap ms-2">Thickness</label>
           <input id="thickness" type="range" min="1" max="12" value="2" class="form-range w-25" />
           <div class="vr"></div>
-          <button class="btn btn-primary" id="btnSave">Save Edits</button>
+          <button class="btn btn-success" id="btnSave">Save Edits</button>
           <button class="btn btn-outline-light" id="btnUndo">Undo</button>
           <button class="btn btn-outline-light" id="btnRedo">Redo</button>
           <div class="vr"></div>
@@ -148,6 +155,34 @@ INDEX_HTML = r"""
   </div>
 </div>
 
+<!-- Signature Modal -->
+<div class="modal fade" id="sigModal" tabindex="-1" aria-labelledby="sigModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered" style="max-width:720px;">
+    <div class="modal-content bg-dark text-light border-secondary">
+      <div class="modal-header">
+        <h5 class="modal-title" id="sigModalLabel">Create Your Signature</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p class="mb-2">Draw your signature, or upload an image (PNG/JPG with transparent/white background).</p>
+        <div class="d-flex gap-3 align-items-start">
+          <canvas id="sigCanvas" width="600" height="220" class="sig-canvas"></canvas>
+          <div class="d-flex flex-column gap-2" style="min-width: 120px;">
+            <button id="sigClear" class="btn btn-outline-light">Clear</button>
+            <input id="sigUpload" type="file" class="form-control" accept="image/png,image/jpeg" />
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <small class="text-secondary me-auto">Tip: Use a trackpad or phone to draw for best results.</small>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button id="sigSave" type="button" class="btn btn-primary" data-bs-dismiss="modal">Save Signature</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 (() => {
   let docId = null;
@@ -163,6 +198,7 @@ INDEX_HTML = r"""
     redo: [],
     drawing: false,
     stroke: [],
+    signatureDataURL: null,     // saved signature image (dataURL)
   };
 
   const el = (id) => document.getElementById(id);
@@ -173,6 +209,9 @@ INDEX_HTML = r"""
       toolbarBtns.forEach((x) => x.classList.remove('tool-active'));
       b.classList.add('tool-active');
       state.tool = b.getAttribute('data-tool');
+      if (state.tool === 'signature' && !state.signatureDataURL) {
+        openSignatureModal();
+      }
     });
   });
 
@@ -222,11 +261,17 @@ INDEX_HTML = r"""
 
   el('btnSave').addEventListener('click', async () => {
     if (!docId || !state.stack.length) return;
-    const payload = { actions: state.stack };
+    // Prepare payload: for stamp_image actions, send hex instead of dataURL
+    const actions = state.stack.map(a => {
+      if (a.type === 'stamp_image' && a.imageDataURL) {
+        return { ...a, image_hex: dataURLToHex(a.imageDataURL), imageDataURL: undefined };
+      }
+      return a;
+    });
     const r = await fetch('/annotate/' + docId, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ actions }),
     });
     const j = await r.json();
     if (!j.ok) return alert(j.error || 'Save failed');
@@ -277,6 +322,17 @@ INDEX_HTML = r"""
     return [(n>>16)&255, (n>>8)&255, n&255];
   }
 
+  // Convert dataURL -> hex string (for server)
+  function dataURLToHex(dataURL) {
+    const binStr = atob(dataURL.split(',')[1]);
+    let hex = '';
+    for (let i = 0; i < binStr.length; i++) {
+      const h = binStr.charCodeAt(i).toString(16).padStart(2, '0');
+      hex += h;
+    }
+    return hex;
+  }
+
   function redrawOverlay() {
     const ctx = overlay.getContext('2d');
     ctx.clearRect(0,0,overlay.width, overlay.height);
@@ -292,6 +348,32 @@ INDEX_HTML = r"""
       for (let i=1; i<state.stroke.length; i++) ctx.lineTo(state.stroke[i][0], state.stroke[i][1]);
       ctx.stroke();
     }
+  }
+
+  // cache images for local preview of stamps/signatures
+  const imgCache = new Map();
+  function drawStamp(ctx, a) {
+    const r = a.rect;
+    const w = r[2]-r[0], h = r[3]-r[1];
+    if (a.imageDataURL) {
+      let img = imgCache.get(a.imageDataURL);
+      if (!img) {
+        img = new Image();
+        img.onload = () => { redrawOverlay(); };
+        img.src = a.imageDataURL;
+        imgCache.set(a.imageDataURL, img);
+      }
+      if (img.complete) {
+        ctx.drawImage(img, r[0], r[1], w, h);
+        return;
+      }
+    }
+    // fallback: draw a placeholder box
+    ctx.save();
+    ctx.strokeStyle = '#999';
+    ctx.setLineDash([6,4]);
+    ctx.strokeRect(r[0], r[1], w, h);
+    ctx.restore();
   }
 
   function drawLocal(ctx, a) {
@@ -332,6 +414,8 @@ INDEX_HTML = r"""
         for (let i=1; i<stroke.length; i++) ctx.lineTo(stroke[i][0], stroke[i][1]);
         ctx.stroke();
       }
+    } else if (a.type === 'stamp_image') {
+      drawStamp(ctx, a);
     }
     ctx.restore();
   }
@@ -357,11 +441,14 @@ INDEX_HTML = r"""
   let start = null;
   overlay.addEventListener('mousedown', (e) => {
     if (!state.tool) return;
+    if (state.tool === 'signature' && !state.signatureDataURL) {
+      openSignatureModal();
+      return;
+    }
     state.drawing = true;
     const {x,y} = rel(e);
     start = [x,y];
     if (state.tool === 'ink') state.stroke = [[x,y]];
-    // enable drawing through pointer events
     overlay.style.pointerEvents = 'auto';
   });
 
@@ -373,10 +460,19 @@ INDEX_HTML = r"""
       redrawOverlay();
       return;
     }
-    // preview
     redrawOverlay();
     const ctx = overlay.getContext('2d');
-    drawLocal(ctx, previewAction(start, [x,y]));
+    const preview = previewAction(start, [x,y]);
+    // for stamp preview, draw a dashed box
+    if (preview.type === 'stamp_image') {
+      ctx.save();
+      ctx.setLineDash([6,4]);
+      const r = preview.rect; ctx.strokeStyle = '#bbb';
+      ctx.strokeRect(r[0], r[1], r[2]-r[0], r[3]-r[1]);
+      ctx.restore();
+    } else {
+      drawLocal(ctx, preview);
+    }
   });
 
   overlay.addEventListener('mouseup', (e) => {
@@ -397,9 +493,12 @@ INDEX_HTML = r"""
       return;
     }
     const a = previewAction(start, [x,y]);
-    // Special case: textbox asks once
     if (state.tool === 'textbox') {
       a.text = prompt('Text content?') || '';
+    }
+    // For signature / stamp_image, attach dataURL for local preview
+    if (a.type === 'stamp_image') {
+      a.imageDataURL = state.signatureDataURL;
     }
     state.stack.push(a); state.redo = [];
     redrawOverlay();
@@ -413,196 +512,4 @@ INDEX_HTML = r"""
   function previewAction(p1, p2) {
     const color = hexToRgb(state.color);
     const base = { page: currentPage, color, colorHex: state.color, thickness: state.thickness };
-    if (state.tool === 'highlight' || state.tool === 'strikeout' || state.tool === 'rect' || state.tool === 'circle' || state.tool === 'textbox') {
-      const rect = [Math.min(p1[0],p2[0]), Math.min(p1[1],p2[1]), Math.max(p1[0],p2[0]), Math.max(p1[1],p2[1])];
-      if (state.tool === 'highlight') return { ...base, type:'highlight', rect, opacity:0.35 };
-      if (state.tool === 'strikeout') return { ...base, type:'strikeout', rect, opacity:0.25 };
-      if (state.tool === 'rect') return { ...base, type:'shape_rect', rect };
-      if (state.tool === 'circle') return { ...base, type:'shape_circle', rect };
-      if (state.tool === 'textbox') return { ...base, type:'textbox', rect, font_size:14, text:'' };
-    }
-    if (state.tool === 'arrow' || state.tool === 'line') {
-      return { ...base, type: state.tool, points: [p1, p2] };
-    }
-    return base;
-  }
-
-})();
-</script>
-</body>
-</html>
-"""
-
-@app.get("/")
-def index():
-    return render_template_string(INDEX_HTML)
-
-@app.post("/upload")
-def upload():
-    f = request.files.get("file")
-    if not f or not _allowed(f.filename):
-        return jsonify({"error": "Please upload a PDF file"}), 400
-    filename = secure_filename(f.filename)
-    doc_id = str(uuid.uuid4())
-    key_original = f"{doc_id}/original.pdf"
-    Storage.save(f.read(), key_original)
-    key_working = f"{doc_id}/working.pdf"
-    Storage.save(Storage.get(key_original), key_working)
-    DOCS[doc_id] = {
-        "name": filename,
-        "original": key_original,
-        "working": key_working,
-        "versions": [key_working],
-        "created": datetime.utcnow().isoformat(),
-    }
-    return jsonify({"doc_id": doc_id})
-
-@app.get("/thumbs/<doc_id>")
-def thumbs(doc_id):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
-    return jsonify({"pages": len(pdf)})
-
-@app.get("/thumb/<doc_id>/<int:page>")
-def thumb(doc_id, page):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
-    if not (0 <= page < len(pdf)):
-        return jsonify({"error": "bad page"}), 400
-    pix = pdf[page].get_pixmap(dpi=120)
-    bio = io.BytesIO(pix.tobytes("png"))
-    bio.seek(0)
-    return send_file(bio, mimetype="image/png")
-
-@app.get("/page/<doc_id>/<int:page>")
-def page_png(doc_id, page):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    zoom = float(request.args.get("zoom", "1.0"))
-    dpi = max(72, min(300, int(144 * zoom)))
-    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
-    if not (0 <= page < len(pdf)):
-        return jsonify({"error": "bad page"}), 400
-    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-    pix = pdf[page].get_pixmap(matrix=mat, alpha=False)
-    bio = io.BytesIO(pix.tobytes("png"))
-    bio.seek(0)
-    return send_file(bio, mimetype="image/png")
-
-@app.post("/annotate/<doc_id>")
-def annotate(doc_id):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    data = request.get_json(force=True) or {}
-    actions = data.get("actions", [])
-    if not actions:
-        return jsonify({"ok": True, "message": "nothing to do"})
-    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
-
-    for a in actions:
-        t = a.get("type")
-        page = pdf[a["page"]]
-        if t == "highlight":
-            rect = fitz.Rect(*a["rect"])
-            annot = page.add_highlight_annot(rect)
-            annot.set_colors(stroke=_color_tuple(a.get("color")))
-            if "opacity" in a: annot.set_opacity(float(a["opacity"]))
-            annot.update()
-
-        elif t == "strikeout":
-            rect = fitz.Rect(*a["rect"])
-            annot = page.add_strikeout_annot(rect)
-            annot.set_colors(stroke=_color_tuple(a.get("color")))
-            if "opacity" in a: annot.set_opacity(float(a["opacity"]))
-            annot.update()
-
-        elif t == "shape_rect":
-            rect = fitz.Rect(*a["rect"])
-            annot = page.add_rect_annot(rect)
-            annot.set_border(width=float(a.get("thickness", 2)))
-            annot.set_colors(stroke=_color_tuple(a.get("color")))
-            annot.update()
-
-        elif t == "shape_circle":
-            rect = fitz.Rect(*a["rect"])
-            annot = page.add_circle_annot(rect)
-            annot.set_border(width=float(a.get("thickness", 2)))
-            annot.set_colors(stroke=_color_tuple(a.get("color")))
-            annot.update()
-
-        elif t in ("line", "arrow"):
-            p1, p2 = a["points"][0], a["points"][1]
-            annot = page.add_line_annot(fitz.Point(*p1), fitz.Point(*p2))
-            annot.set_border(width=float(a.get("thickness", 2)))
-            annot.set_colors(stroke=_color_tuple(a.get("color")))
-            # Try arrowheads if available; ignore if not supported in current PyMuPDF
-            if t == "arrow":
-                try:
-                    # Newer PyMuPDF: pass names; older: may require integer codes
-                    annot.set_line_ends(("OpenArrow", "None"))
-                except Exception:
-                    pass
-            annot.update()
-
-        elif t == "ink":
-            # points: list of strokes; each stroke is list of [x,y]
-            strokes = []
-            for stroke in a["points"]:
-                strokes.append([fitz.Point(*pt) for pt in stroke])
-            annot = page.add_ink_annot(strokes)
-            annot.set_colors(stroke=_color_tuple(a.get("color")))
-            annot.set_border(width=float(a.get("thickness", 2)))
-            annot.update()
-
-        elif t == "textbox":
-            rect = fitz.Rect(*a["rect"])
-            content = a.get("text", "")
-            annot = page.add_freetext_annot(rect, content)
-            annot.set_colors(stroke=_color_tuple(a.get("color", [0,0,0])))
-            try:
-                annot.set_font("helv", float(a.get("font_size", 14)))
-            except Exception:
-                pass
-            annot.update()
-
-        # You can add more types here (watermark_text, stamp_image, form_fill) later.
-
-    out = io.BytesIO()
-    pdf.save(out)
-    out.seek(0)
-    new_key = f"{doc_id}/{uuid.uuid4().hex}.pdf"
-    Storage.save(out.read(), new_key)
-    DOCS[doc_id]["working"] = new_key
-    DOCS[doc_id]["versions"].append(new_key)
-    return jsonify({"ok": True, "version": len(DOCS[doc_id]['versions'])})
-
-@app.post("/revert/<doc_id>")
-def revert(doc_id):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    vers = DOCS[doc_id]["versions"]
-    if len(vers) < 2:
-        return jsonify({"error": "no previous version"}), 400
-    vers.pop()  # drop current
-    DOCS[doc_id]["working"] = vers[-1]
-    return jsonify({"ok": True, "version": len(vers)})
-
-@app.get("/download/<doc_id>")
-def download(doc_id):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    data = Storage.get(DOCS[doc_id]["working"])
-    return send_file(io.BytesIO(data), mimetype="application/pdf",
-                     as_attachment=True, download_name=DOCS[doc_id]["name"])
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-# ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # Run: python app.py
-    # Then open http://localhost:8000
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    if (state.tool === 'highlight' || state.tool === 'strikeout' || state.tool === 'rect' || state.tool ===

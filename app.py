@@ -1,9 +1,20 @@
 # app.py — Single-file Flask PDF Editor (PyMuPDF + Bootstrap)
-# Fixes:
-# - Canvas overlay now receives mouse events (pointer-events: auto + z-index)
-# - Better error handling (alerts when upload/thumb/page/annotate fails)
-# - Signature tool included
-# - Works with Gunicorn or python app.py (respects $PORT)
+# Features
+# - Upload PDF
+# - Thumbnails + per-page render with zoom
+# - Annotations: highlight, strikeout, rectangle, circle, line, arrow
+# - Freehand ink, Text Box (FreeText), Signature (draw -> place)
+# - Client undo/redo (before save), server rollback (version history)
+# - Local storage by default (relative keys), optional S3
+# - Correct screen->PDF coordinate scaling with viewport
+# - Works with python app.py or Gunicorn; respects $PORT
+#
+# Requirements (add to requirements.txt):
+# Flask==3.0.3
+# python-dotenv==1.0.1
+# PyMuPDF==1.24.6
+# (optional for prod) gunicorn==22.0.0
+# (optional for S3) boto3==1.34.162
 
 import io, os, uuid, base64
 from datetime import datetime
@@ -13,6 +24,7 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
+# ───────────────────────────── Config ─────────────────────────────
 load_dotenv()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "dev-secret")
@@ -33,26 +45,39 @@ if USE_S3:
 else:
     s3, S3_BUCKET = None, None
 
+# In-memory doc registry (swap for DB if needed)
 DOCS = {}  # {doc_id: {name, original, working, versions[], created}}
 
+# ─────────────────────── Storage Abstraction ──────────────────────
 class Storage:
     @staticmethod
-    def save(file_bytes: bytes, key: str):
+    def save(file_bytes: bytes, key: str) -> str:
+        """
+        Save bytes under `key`:
+          • S3: object key
+          • Local: RELATIVE path under WORK_DIR
+        Returns key (relative or S3 object key).
+        """
         if USE_S3:
             s3.put_object(Bucket=S3_BUCKET, Key=key, Body=file_bytes, ContentType="application/pdf")
             return key
         path = WORK_DIR / key
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(file_bytes)
-        return str(path)
+        return key  # return RELATIVE key
 
     @staticmethod
     def get(key: str) -> bytes:
+        """Read bytes; accepts relative or absolute path for local."""
         if USE_S3:
             obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
             return obj["Body"].read()
-        return (WORK_DIR / key).read_bytes()
+        p = Path(key)
+        if not p.is_absolute():
+            p = WORK_DIR / key
+        return p.read_bytes()
 
+# ───────────────────────────── Helpers ────────────────────────────
 def _allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXT
 
@@ -63,6 +88,7 @@ def _color_tuple(rgb_list):
     return (r, g, b)
 
 def _scale_rect(rect, page_rect, viewport):
+    # rect in screen pixels -> PDF points
     vx, vy = max(1, int(viewport.get("w", 1))), max(1, int(viewport.get("h", 1)))
     sx, sy = page_rect.width / vx, page_rect.height / vy
     x0, y0, x1, y1 = rect
@@ -74,18 +100,20 @@ def _scale_point(pt, page_rect, viewport):
     return fitz.Point(pt[0] * sx, pt[1] * sy)
 
 def _decode_data_url(data_url: str) -> bytes:
+    # expects "data:image/png;base64,...."
     if not data_url or "," not in data_url:
         return b""
     _, b64 = data_url.split(",", 1)
     return base64.b64decode(b64)
 
-# Slightly reduce caching of images so page refresh shows latest version
+# Avoid caching thumbs/pages so new versions show right away
 @app.after_request
 def add_no_cache(resp):
     if request.path.startswith(("/thumb/", "/page/")):
         resp.headers["Cache-Control"] = "no-store, max-age=0"
     return resp
 
+# ─────────────────────────── UI (inline) ─────────────────────────
 INDEX_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -100,7 +128,7 @@ INDEX_HTML = r"""
     #thumbs { max-height:80vh; overflow:auto; }
     #canvasWrap { position:relative; background:#101425; padding:0; min-height:60vh; }
     #pageImg { display:block; max-width:100%; height:auto; position:relative; z-index:1; }
-    #overlay { position:absolute; left:0; top:0; pointer-events:auto; z-index:2; } /* FIX: receive events */
+    #overlay { position:absolute; left:0; top:0; pointer-events:auto; z-index:2; }
     .tool-active { outline:2px solid #6ea8fe; }
     .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#11162a; border:1px solid #2a355d; border-radius:6px; padding:1px 6px; }
     .card.bg-dark { background:#0f1428 !important; }
@@ -214,11 +242,12 @@ INDEX_HTML = r"""
     });
   });
 
-  // Shortcuts
+  // Keyboard shortcuts
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     const map = { h:'highlight', s:'strikeout', r:'rect', c:'circle', l:'line', a:'arrow', i:'ink', t:'textbox', g:'signature' };
-    if (map[k]) document.querySelector(`[data-tool="${map[k]}"]`)?.click();
+    const btn = document.querySelector(`[data-tool="${map[k]}"]`);
+    if (btn) btn.click();
     if ((e.ctrlKey||e.metaKey) && k==='z') el('btnUndo').click();
     if ((e.ctrlKey||e.metaKey) && k==='y') el('btnRedo').click();
   });
@@ -227,6 +256,7 @@ INDEX_HTML = r"""
   el('thickness').addEventListener('input', e => state.thickness = +e.target.value);
   el('zoom').addEventListener('input', e => { zoom = +e.target.value; renderPage(); });
 
+  // Upload
   el('file').addEventListener('change', async (e) => {
     const f = e.target.files[0];
     if (!f) return;
@@ -244,8 +274,8 @@ INDEX_HTML = r"""
     }
   });
 
+  // Download / Rollback
   el('btnDownload').addEventListener('click', () => { if (docId) window.location.href = '/download/' + docId; });
-
   el('btnUndoServer').addEventListener('click', async () => {
     if (!docId) return;
     try {
@@ -254,15 +284,14 @@ INDEX_HTML = r"""
       if (!j.ok) throw new Error(j.error || 'Rollback failed');
       state.stack = []; state.redo = [];
       await renderPage();
-    } catch (err) {
-      alert('Rollback error: ' + err.message);
-      console.error(err);
-    }
+    } catch (err) { alert('Rollback error: ' + err.message); console.error(err); }
   });
 
+  // Local undo/redo
   el('btnUndo').addEventListener('click', () => { if (state.stack.length) { state.redo.push(state.stack.pop()); redrawOverlay(); } });
   el('btnRedo').addEventListener('click', () => { if (state.redo.length) { state.stack.push(state.redo.pop()); redrawOverlay(); } });
 
+  // Save
   el('btnSave').addEventListener('click', async () => {
     if (!docId || !state.stack.length) return;
     try {
@@ -275,61 +304,48 @@ INDEX_HTML = r"""
       if (!j.ok) throw new Error(j.error || 'Save failed');
       state.stack = []; state.redo = [];
       await renderPage();
-    } catch (err) {
-      alert('Save error: ' + err.message);
-      console.error(err);
-    }
+    } catch (err) { alert('Save error: ' + err.message); console.error(err); }
   });
 
+  // Thumbnails
   async function loadThumbs() {
-    try {
-      const r = await fetch('/thumbs/' + docId);
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || 'Thumbs failed');
-      totalPages = j.pages;
-      const wrap = el('thumbs'); wrap.innerHTML = '';
-      for (let i = 0; i < totalPages; i++) {
-        const img = document.createElement('img');
-        img.src = `/thumb/${docId}/${i}`;
-        img.className = 'img-fluid mb-2 rounded';
-        img.style.cursor = 'pointer';
-        img.addEventListener('click', () => renderPage(i));
-        wrap.appendChild(img);
-      }
-    } catch (err) {
-      alert('Thumbs error: ' + err.message);
-      console.error(err);
+    const r = await fetch('/thumbs/' + docId);
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'Thumbs failed');
+    totalPages = j.pages;
+    const wrap = el('thumbs'); wrap.innerHTML = '';
+    for (let i = 0; i < totalPages; i++) {
+      const img = document.createElement('img');
+      img.src = `/thumb/${docId}/${i}`;
+      img.className = 'img-fluid mb-2 rounded';
+      img.style.cursor = 'pointer';
+      img.addEventListener('click', () => renderPage(i));
+      wrap.appendChild(img);
     }
   }
 
   const pageImg = el('pageImg'), overlay = el('overlay');
 
   function syncOverlaySize() {
-    // Align overlay with the displayed image
-    overlay.width = pageImg.clientWidth || overlay.width;
-    overlay.height = pageImg.clientHeight || overlay.height;
-    overlay.style.width = overlay.width + 'px';
+    overlay.width  = Math.max(pageImg.clientWidth  || 1, 1);
+    overlay.height = Math.max(pageImg.clientHeight || 1, 1);
+    overlay.style.width  = overlay.width  + 'px';
     overlay.style.height = overlay.height + 'px';
     overlay.style.left = '0px';
-    overlay.style.top = '0px';
+    overlay.style.top  = '0px';
   }
   window.addEventListener('resize', syncOverlaySize);
 
   async function renderPage(p = currentPage) {
     if (docId == null) return;
     currentPage = p;
-    try {
-      pageImg.src = `/page/${docId}/${currentPage}?zoom=${zoom}`;
-      await new Promise((res, rej) => {
-        pageImg.onload = () => res();
-        pageImg.onerror = () => rej(new Error('Failed to load page image'));
-      });
-      syncOverlaySize();
-      redrawOverlay();
-    } catch (err) {
-      alert('Render page error: ' + err.message);
-      console.error(err);
-    }
+    pageImg.src = `/page/${docId}/${currentPage}?zoom=${zoom}`;
+    await new Promise((res, rej) => {
+      pageImg.onload = () => res();
+      pageImg.onerror = () => rej(new Error('Failed to load page image'));
+    });
+    syncOverlaySize();
+    redrawOverlay();
   }
 
   function hexToRgb(hex) {
@@ -401,6 +417,7 @@ INDEX_HTML = r"""
 
   const overlay = document.getElementById('overlay');
 
+  // Mouse interactions on overlay
   let start = null;
   overlay.addEventListener('mousedown', (e) => {
     if (!state.tool) return;
@@ -427,10 +444,7 @@ INDEX_HTML = r"""
     state.stack.push(a); state.redo = []; redrawOverlay();
   });
 
-  function rel(e) {
-    const r = overlay.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
-  }
+  function rel(e) { const r = overlay.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
 
   function previewAction(p1, p2, forPreview) {
     const color = hexToRgb(state.color);
@@ -488,6 +502,7 @@ INDEX_HTML = r"""
 </html>
 """
 
+# ───────────────────────────── Routes ────────────────────────────
 @app.get("/")
 def index():
     return render_template_string(INDEX_HTML)
@@ -499,14 +514,17 @@ def upload():
         return jsonify({"error": "Please upload a PDF file"}), 400
     filename = secure_filename(f.filename)
     doc_id = str(uuid.uuid4())
+
     key_original = f"{doc_id}/original.pdf"
     Storage.save(f.read(), key_original)
+
     key_working = f"{doc_id}/working.pdf"
     Storage.save(Storage.get(key_original), key_working)
+
     DOCS[doc_id] = {
         "name": filename,
-        "original": key_original,
-        "working": key_working,
+        "original": key_original,    # relative key
+        "working": key_working,      # relative key
         "versions": [key_working],
         "created": datetime.utcnow().isoformat(),
     }
@@ -659,6 +677,7 @@ def download(doc_id):
 def health():
     return jsonify({"ok": True})
 
+# ───────────────────────────── Entrypoint ─────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)

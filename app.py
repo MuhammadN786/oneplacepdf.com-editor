@@ -1,20 +1,15 @@
 # app.py — Single-file Flask PDF Editor (PyMuPDF + Bootstrap)
-# Features
-# - Upload PDF
-# - Thumbnails + per-page render with zoom
-# - Annotations: highlight, strikeout, rectangle, circle, line, arrow
-# - Freehand ink, Text Box (FreeText), Signature (draw -> place)
-# - Client undo/redo (before save), server rollback (version history)
-# - Local storage by default (relative keys), optional S3
-# - Correct screen->PDF coordinate scaling with viewport
-# - Works with python app.py or Gunicorn; respects $PORT
+# Works end-to-end: upload → thumbnails → render → annotate → save → download
+# Fix: removed duplicate JS const for `overlay` that caused a parse error.
+# Features: highlight, strikeout, rectangle, circle, line, arrow, ink, textbox, signature,
+# zoom, thumbnails, undo/redo, server rollback, local or S3 storage.
 #
-# Requirements (add to requirements.txt):
+# requirements.txt (minimum):
 # Flask==3.0.3
 # python-dotenv==1.0.1
 # PyMuPDF==1.24.6
-# (optional for prod) gunicorn==22.0.0
-# (optional for S3) boto3==1.34.162
+# gunicorn==22.0.0        # (recommended on Render/Heroku)
+# boto3==1.34.162         # (only if USE_S3=true)
 
 import io, os, uuid, base64
 from datetime import datetime
@@ -45,30 +40,22 @@ if USE_S3:
 else:
     s3, S3_BUCKET = None, None
 
-# In-memory doc registry (swap for DB if needed)
 DOCS = {}  # {doc_id: {name, original, working, versions[], created}}
 
 # ─────────────────────── Storage Abstraction ──────────────────────
 class Storage:
     @staticmethod
     def save(file_bytes: bytes, key: str) -> str:
-        """
-        Save bytes under `key`:
-          • S3: object key
-          • Local: RELATIVE path under WORK_DIR
-        Returns key (relative or S3 object key).
-        """
         if USE_S3:
             s3.put_object(Bucket=S3_BUCKET, Key=key, Body=file_bytes, ContentType="application/pdf")
             return key
         path = WORK_DIR / key
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(file_bytes)
-        return key  # return RELATIVE key
+        return key  # relative key
 
     @staticmethod
     def get(key: str) -> bytes:
-        """Read bytes; accepts relative or absolute path for local."""
         if USE_S3:
             obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
             return obj["Body"].read()
@@ -88,7 +75,6 @@ def _color_tuple(rgb_list):
     return (r, g, b)
 
 def _scale_rect(rect, page_rect, viewport):
-    # rect in screen pixels -> PDF points
     vx, vy = max(1, int(viewport.get("w", 1))), max(1, int(viewport.get("h", 1)))
     sx, sy = page_rect.width / vx, page_rect.height / vy
     x0, y0, x1, y1 = rect
@@ -100,7 +86,6 @@ def _scale_point(pt, page_rect, viewport):
     return fitz.Point(pt[0] * sx, pt[1] * sy)
 
 def _decode_data_url(data_url: str) -> bytes:
-    # expects "data:image/png;base64,...."
     if not data_url or "," not in data_url:
         return b""
     _, b64 = data_url.split(",", 1)
@@ -221,6 +206,9 @@ INDEX_HTML = r"""
 
 <script>
 (() => {
+  // Simple global error hook to surface any script issues
+  window.addEventListener('error', (e) => console.error('JS error:', e.message));
+
   let docId = null, currentPage = 0, totalPages = 0, zoom = 1.2;
 
   const state = {
@@ -232,6 +220,10 @@ INDEX_HTML = r"""
 
   const el = (id) => document.getElementById(id);
   const toolbarBtns = [...document.querySelectorAll('[data-tool]')];
+
+  // Elements (NOTE: only one declaration of `overlay`)
+  const pageImg = el('pageImg');
+  const overlay = el('overlay');
 
   // Tool buttons
   toolbarBtns.forEach((b) => {
@@ -324,8 +316,6 @@ INDEX_HTML = r"""
     }
   }
 
-  const pageImg = el('pageImg'), overlay = el('overlay');
-
   function syncOverlaySize() {
     overlay.width  = Math.max(pageImg.clientWidth  || 1, 1);
     overlay.height = Math.max(pageImg.clientHeight || 1, 1);
@@ -348,10 +338,7 @@ INDEX_HTML = r"""
     redrawOverlay();
   }
 
-  function hexToRgb(hex) {
-    const n = parseInt(hex.slice(1), 16);
-    return [(n>>16)&255, (n>>8)&255, n&255];
-  }
+  function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [(n>>16)&255, (n>>8)&255, n&255]; }
 
   function redrawOverlay() {
     const ctx = overlay.getContext('2d');
@@ -414,8 +401,6 @@ INDEX_HTML = r"""
     }
     ctx.fillText(line, x, y);
   }
-
-  const overlay = document.getElementById('overlay');
 
   // Mouse interactions on overlay
   let start = null;
@@ -523,8 +508,8 @@ def upload():
 
     DOCS[doc_id] = {
         "name": filename,
-        "original": key_original,    # relative key
-        "working": key_working,      # relative key
+        "original": key_original,
+        "working": key_working,
         "versions": [key_working],
         "created": datetime.utcnow().isoformat(),
     }

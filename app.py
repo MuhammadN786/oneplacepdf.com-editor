@@ -1,595 +1,503 @@
-# app.py — OnePlacePDF Editor (Pro)
-# Single-file Flask app for an in-browser PDF editor with rich tools.
-#
-# Features (client):
-# - PDF.js viewer (render + text layer) with thumbnails & drag-to-reorder (SortableJS)
-# - Tools: Select/Move, Text, Whiteout, Highlight, Draw (pen), Image, Link, Sign (type/draw/upload),
-#          Crop, Rotate, Delete page, Find & Replace, Page reorder (thumbnails)
-# - Multi-object drag/resize/rotate (interact.js), snapping, undo/redo, keyboard shortcuts
-# - Exports an operations JSON which is applied server-side with PyMuPDF
-#
-# Features (server):
-# - /  : Editor UI
-# - /apply : Accepts original PDF + operations JSON and burns edits into a new PDF
-# - /health : Health check
-#
-# Deploy notes:
-#   pip install flask pymupdf pillow
-#   python app.py
-#
-#   For production, front a reverse proxy (Render, Cloudflare, Nginx) and set MAX_CONTENT_LENGTH as you like.
-
-import io, os, json, base64, math, tempfile
-from typing import List, Dict, Any, Tuple
-
-from flask import Flask, request, send_file, render_template_string, make_response
+import os, io, uuid, shutil, time, json
+from typing import List
+from flask import (
+    Flask, request, redirect, url_for, send_file, abort,
+    render_template_string, jsonify, session
+)
 import fitz  # PyMuPDF
 from PIL import Image
 
-APP_NAME = "OnePlacePDF Editor"
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
-
+# ----------------- Basic setup -----------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
-# --------------------- UI ---------------------
-PAGE = r"""
+TMP_DIR = "/tmp/pdfedit"
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# In-memory map: doc_id -> file path (ephemeral, fine for 1 worker)
+OPEN_DOCS = {}
+
+# ----------------- HTML (Bootstrap) -----------------
+BASE_HTML = r"""
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ app_name }} — Edit PDF Online</title>
-  <meta name="description" content="Edit PDFs free: add text, whiteout, highlight, draw, links, signatures, crop, rotate, delete and reorder pages. No hourly limits." />
+  <meta charset="utf-8">
+  <title>OnePlacePDF Editor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    :root{
-      --bg:#0b1020; --card:#121a2b; --muted:#a9b2c7; --fg:#eaf0ff; --accent:#5da0ff; --accent2:#00d2d3; --border:#263149;
-    }
-    *{box-sizing:border-box}
-    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--fg);background:#0b1020}
-    header{position:sticky;top:0;z-index:10;background:#0d1426cc;backdrop-filter:blur(6px);border-bottom:1px solid var(--border)}
-    .wrap{max-width:1200px;margin:0 auto;padding:10px 14px}
-    .brand{display:flex;align-items:center;gap:10px;font-weight:700}
-    .toolbar{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
-    .tool{background:#0e1629;border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:8px 10px;cursor:pointer;font-size:14px}
-    .tool.active{border-color:var(--accent);box-shadow:0 0 0 2px #5da0ff33 inset}
-    main{display:grid;grid-template-columns:260px 1fr;gap:12px;padding:12px}
-    .panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px}
-    #thumbs{height:calc(100vh - 210px);overflow:auto}
-    .thumb{border:1px solid var(--border);border-radius:8px;margin:6px 0;padding:6px;background:#0d1426;cursor:grab}
-    .thumb.active{outline:2px solid var(--accent)}
-    .thumb img{width:100%;display:block;border-radius:6px}
-    #viewer{height:calc(100vh - 160px);overflow:auto;background:#0a0f1f;border:1px solid var(--border);border-radius:12px;position:relative}
-    .page{position:relative;margin:16px auto;background:white;box-shadow:0 2px 10px #0008}
-    .overlay{position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none}
-    .handle{position:absolute;border:1px dashed #5da0ff;pointer-events:auto}
-    .handle[data-type="text"]{background:#fff0}
-    .handle.selected{box-shadow:0 0 0 2px #5da0ff}
-    .ghost{opacity:.5}
-    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    input[type="file"],select,input,button{font-size:14px}
-    .right{margin-left:auto}
-    .hint{color:var(--muted);font-size:12px;margin-top:6px}
-    .pill{display:inline-flex;align-items:center;gap:6px;background:#0e1629;border:1px solid var(--border);border-radius:999px;padding:6px 10px}
+    body{ background:#0b1020; color:#eaf2ff }
+    .navbar{ background:#0e1530 }
+    .btn-primary{ background:#2563eb; border-color:#2563eb }
+    .thumb{ border:1px solid #1f2a44; border-radius:6px; background:#0f172a }
+    .thumb img{ width:100%; display:block; border-radius:6px }
+    .page-tile{ cursor:pointer; transition:transform .07s }
+    .page-tile:hover{ transform:translateY(-2px) }
+    .page-tile.selected{ outline:2px solid #22c55e; outline-offset:2px }
+    .sidebar{ position:sticky; top:1rem }
+    code{ color:#9cd2ff }
   </style>
-  <!-- PDF.js (worker version) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.js"></script>
-  <script>
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.js";
-  </script>
-  <!-- interact.js for drag/resize -->
-  <script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
-  <!-- SortableJS for drag-to-reorder thumbnails -->
-  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
 </head>
 <body>
-  <header>
-    <div class="wrap">
-      <div class="brand">📄 {{ app_name }}</div>
-      <div class="toolbar" id="toolbar">
-        <label class="pill">
-          <input id="file" type="file" accept="application/pdf" hidden>
-          <span>Upload PDF</span>
-        </label>
-        <button class="tool" data-tool="select">Select</button>
-        <button class="tool" data-tool="text">Text</button>
-        <button class="tool" data-tool="whiteout">Whiteout</button>
-        <button class="tool" data-tool="highlight">Highlight</button>
-        <button class="tool" data-tool="draw">Draw</button>
-        <button class="tool" data-tool="image">Image</button>
-        <button class="tool" data-tool="link">Link</button>
-        <button class="tool" data-tool="sign">Sign</button>
-        <button class="tool" data-tool="crop">Crop</button>
-        <button class="tool" data-tool="find">Find/Replace</button>
-        <span class="right"></span>
-        <button class="tool" id="rotateL">⟲ Rotate</button>
-        <button class="tool" id="rotateR">⟳ Rotate</button>
-        <button class="tool" id="deletePg">🗑 Delete page</button>
-        <button class="tool" id="undo">Undo</button>
-        <button class="tool" id="redo">Redo</button>
-        <button class="tool" id="apply">Apply changes</button>
-      </div>
-    </div>
-  </header>
 
-  <main class="wrap">
-    <div class="panel">
-      <div class="row" style="margin-bottom:8px">
-        <strong>Pages</strong>
-        <span class="hint">Drag to reorder</span>
-      </div>
-      <div id="thumbs"></div>
-    </div>
+<nav class="navbar navbar-expand-lg mb-4">
+  <div class="container">
+    <a class="navbar-brand text-white" href="/">OnePlacePDF <span class="text-secondary">Editor</span></a>
+  </div>
+</nav>
 
-    <div class="panel" style="position:relative">
-      <div class="row" style="margin-bottom:8px">
-        <div class="pill">Zoom
-          <input type="range" id="zoom" min="50" max="200" value="100" style="margin-left:8px">
-          <span id="zoomv">100%</span>
-        </div>
-        <div class="pill">Font
-          <select id="fontSel" style="margin-left:8px">
-            <option value="helv">Helvetica</option>
-            <option value="times">Times</option>
-            <option value="cour">Courier</option>
-          </select>
-          <input type="number" id="fontSize" min="6" max="96" value="16" style="width:70px;margin-left:6px">
-        </div>
-        <div class="pill">Color
-          <input type="color" id="color" value="#000000" style="margin-left:8px">
-          <input type="range" id="opacity" min="10" max="100" value="100" style="width:90px">
-        </div>
-      </div>
-      <div id="viewer"></div>
-      <div class="hint">Tips: Ctrl+Z / Ctrl+Y, Delete to remove selected object, Shift=snaps, drag page in sidebar to reorder, use Rotate/Delete for current page.</div>
-    </div>
-  </main>
+<div class="container">
+  {% block body %}{% endblock %}
+</div>
 
 <script>
-// --- State ---
-let pdfBytes = null;           // original PDF bytes
-let pdfDoc = null;             // PDF.js doc
-let scale = 1.0;               // zoom factor
-let pages = [];                // [{w,h,canvas,overlay,rot,deleted,crop}, ...]
-let tool = 'select';
-let history = [];              // stack of ops snapshots
-let redoStack = [];
-let currentPage = 0;
-let objects = [];              // overlay objects [{id,type,page,x,y,w,h,rotate,props}]
-let selId = null;              // selected object id
-let pageOrder = [];            // array of page indices (reordered)
-
-function pushHistory(){
-  history.push(JSON.stringify({objects, pageOrder:[...pageOrder], pages: pages.map(p=>({rot:p.rot||0, del:!!p.deleted, crop:p.crop||null}))}));
-  if (history.length>100) history.shift();
-  redoStack=[];
-}
-
-function restoreState(snap){
-  const s = JSON.parse(snap);
-  objects = s.objects||[];
-  pageOrder = s.pageOrder || pages.map((_,i)=>i);
-  (s.pages||[]).forEach((sp,i)=>{ if (pages[i]) { pages[i].rot=sp.rot||0; pages[i].deleted=!!sp.del; pages[i].crop=sp.crop||null; } });
-  renderEverything();
-}
-
-function setTool(t){
-  tool=t; document.querySelectorAll('.tool').forEach(b=>b.classList.toggle('active', b.dataset.tool===t));
-}
-
-document.getElementById('toolbar').addEventListener('click', (e)=>{
-  const b = e.target.closest('.tool');
-  if(!b) return;
-  const t = b.dataset.tool;
-  if(t){ setTool(t); return; }
-});
-
-function pt(v){ return v/scale; } // screen px -> PDF pt
-function px(v){ return v*scale; } // PDF pt -> screen px
-
-// Load file
-const fileEl = document.getElementById('file');
-fileEl.addEventListener('change', async ev => {
-  const f = ev.target.files[0]; if(!f) return;
-  pdfBytes = await f.arrayBuffer();
-  await openPDF(pdfBytes);
-  pushHistory();
-});
-
-async function openPDF(buf){
-  pdfDoc = await pdfjsLib.getDocument({data: buf}).promise;
-  pages = []; pageOrder = [...Array(pdfDoc.numPages).keys()];
-  const viewer = document.getElementById('viewer');
-  viewer.innerHTML='';
-  const thumbs = document.getElementById('thumbs');
-  thumbs.innerHTML='';
-
-  for(let i=1;i<=pdfDoc.numPages;i++){
-    const page = await pdfDoc.getPage(i);
-    const v = page.getViewport({scale: 1});
-    const W = Math.round(v.width), H = Math.round(v.height);
-
-    // main canvas
-    const wrap = document.createElement('div');
-    wrap.className='page';
-    wrap.style.width = px(W)+'px';
-    wrap.style.height = px(H)+'px';
-    wrap.dataset.pg = i-1;
-
-    const canvas = document.createElement('canvas');
-    canvas.width=W; canvas.height=H; canvas.style.width='100%'; canvas.style.height='100%';
-
-    const overlay = document.createElement('div'); overlay.className='overlay'; overlay.dataset.pg=i-1;
-
-    wrap.appendChild(canvas); wrap.appendChild(overlay); viewer.appendChild(wrap);
-
-    // render initial
-    await renderPageToCanvas(page, canvas, scale);
-
-    pages.push({w:W,h:H,canvas,overlay,rot:0,deleted:false,crop:null});
-
-    // thumbnail
-    const tdiv = document.createElement('div'); tdiv.className='thumb'; tdiv.dataset.pg=i-1;
-    const timg = document.createElement('img'); timg.width=220; timg.height=Math.round(220*H/W);
-    tdiv.appendChild(timg); thumbs.appendChild(tdiv);
-    const tcanvas = document.createElement('canvas'); tcanvas.width=220; tcanvas.height=timg.height;
-    const ctx = tcanvas.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,tcanvas.width,tcanvas.height);
-    const ratio = 220/W; ctx.drawImage(canvas, 0, 0, W, H, 0, 0, 220, Math.round(H*ratio));
-    timg.src = tcanvas.toDataURL('image/png');
-
-    tdiv.addEventListener('click', ()=>{ selectPage(i-1); });
-  }
-
-  // sortable thumbs
-  Sortable.create(thumbs, {
-    animation: 150,
-    onEnd: (evt)=>{
-      const from = evt.oldIndex, to = evt.newIndex;
-      const id = pageOrder.splice(from,1)[0];
-      pageOrder.splice(to,0,id);
-      pushHistory();
-    }
-  });
-
-  selectPage(0);
-}
-
-async function renderPageToCanvas(page, canvas, s){
-  const v = page.getViewport({scale: s});
-  const ctx = canvas.getContext('2d');
-  canvas.width = Math.round(v.width); canvas.height = Math.round(v.height);
-  await page.render({canvasContext: ctx, viewport: v}).promise;
-}
-
-function selectPage(i){
-  currentPage = i;
-  document.querySelectorAll('.thumb').forEach(d=>d.classList.toggle('active', +d.dataset.pg===i));
-  document.getElementById('viewer').scrollTo({top: pages[i].canvas.parentElement.offsetTop - 16, behavior:'smooth'});
-}
-
-// Zoom
-const zoomEl = document.getElementById('zoom'), zoomv=document.getElementById('zoomv');
-zoomEl.addEventListener('input', async ()=>{
-  scale = +zoomEl.value / 100; zoomv.textContent = `${zoomEl.value}%`;
-  for(let i=0;i<pages.length;i++){
-    const pgnum = pageOrder.indexOf(i)+1; // draw in current visual order
-    const pdfPage = await pdfDoc.getPage(pgnum);
-    await renderPageToCanvas(pdfPage, pages[i].canvas, scale);
-    const wrap = pages[i].canvas.parentElement;
-    wrap.style.width = px(pages[i].w)+'px';
-    wrap.style.height= px(pages[i].h)+'px';
-  }
-  // reposition overlay handles
-  layoutAllObjects();
-});
-
-// Create overlay objects
-function createObject(type, pageIdx, x, y, w, h, extra={}){
-  const id = Math.random().toString(36).slice(2);
-  const obj = {id, type, page: pageIdx, x, y, w, h, rotate:0, props: extra};
-  objects.push(obj);
-  drawHandle(obj);
-  pushHistory();
-  return obj;
-}
-
-function drawHandle(obj){
-  const pg = pages[obj.page];
-  const el = document.createElement('div');
-  el.className='handle'; el.dataset.id=obj.id; el.dataset.type=obj.type;
-  el.style.left=px(obj.x)+"px"; el.style.top=px(obj.y)+"px"; el.style.width=px(obj.w)+"px"; el.style.height=px(obj.h)+"px";
-  el.style.transform = `rotate(${obj.rotate||0}deg)`;
-  el.style.pointerEvents='auto';
-  el.addEventListener('mousedown',()=>selectObj(obj.id));
-  pg.overlay.appendChild(el);
-
-  interact(el).draggable({listeners:{
-      move (ev){ obj.x = pt((parseFloat(el.style.left)||0)+ev.dx); obj.y = pt((parseFloat(el.style.top)||0)+ev.dy); layoutObj(obj); },
-      end(){ pushHistory(); }
-    }, inertia:true })
-    .resizable({ edges:{left:true,right:true,top:true,bottom:true} })
-    .on('resizemove', ev=>{ obj.w = pt(ev.rect.width); obj.h = pt(ev.rect.height); obj.x=pt(ev.rect.left - el.parentElement.getBoundingClientRect().left); obj.y=pt(ev.rect.top - el.parentElement.getBoundingClientRect().top); layoutObj(obj); })
-    .on('resizeend', ()=>pushHistory());
-}
-
-function layoutObj(obj){
-  const el = document.querySelector(`.handle[data-id="${obj.id}"]`);
-  if(!el) return;
-  el.style.left=px(obj.x)+"px"; el.style.top=px(obj.y)+"px"; el.style.width=px(obj.w)+"px"; el.style.height=px(obj.h)+"px"; el.style.transform=`rotate(${obj.rotate||0}deg)`;
-}
-
-function layoutAllObjects(){ objects.forEach(layoutObj); }
-
-function selectObj(id){ selId = id; document.querySelectorAll('.handle').forEach(h=>h.classList.toggle('selected', h.dataset.id===id)); }
-
-// Canvas interactions (creating objects)
-
-document.getElementById('viewer').addEventListener('mousedown', (e)=>{
-  const pgWrap = e.target.closest('.page'); if(!pgWrap) return;
-  const pageIdx = +pgWrap.dataset.pg;
-  const rect = pgWrap.getBoundingClientRect();
-  const startX = e.clientX - rect.left, startY = e.clientY - rect.top;
-
-  if(tool==='text'){
-    const fs = +document.getElementById('fontSize').value; const color=document.getElementById('color').value; const font=document.getElementById('fontSel').value; const op=+document.getElementById('opacity').value/100;
-    const obj = createObject('text', pageIdx, pt(startX), pt(startY), pt(200), pt(fs*1.6), {text:'Double-click to edit', font, size:fs, color, opacity:op});
-    const el = document.querySelector(`.handle[data-id="${obj.id}"]`);
-    el.ondblclick = ()=>{
-      const t = prompt('Text:', obj.props.text||''); if(t!=null){ obj.props.text = t; pushHistory(); }
-    };
-  } else if(tool==='whiteout' || tool==='highlight' || tool==='link' || tool==='image' || tool==='sign' || tool==='draw' || tool==='crop'){
-    const ghost = document.createElement('div'); ghost.className='handle ghost';
-    pgWrap.appendChild(ghost);
-    function move(ev){
-      const x = Math.min(Math.max(0, ev.clientX - rect.left), rect.width);
-      const y = Math.min(Math.max(0, ev.clientY - rect.top), rect.height);
-      const w = Math.abs(x-startX), h=Math.abs(y-startY);
-      const l = Math.min(x,startX), t = Math.min(y,startY);
-      ghost.style.left=l+'px'; ghost.style.top=t+'px'; ghost.style.width=w+'px'; ghost.style.height=h+'px'; ghost.style.position='absolute'; ghost.style.border='1px dashed #5da0ff';
-    }
-    function up(ev){
-      pgWrap.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
-      ghost.remove();
-      const endX = Math.min(Math.max(0, ev.clientX - rect.left), rect.width);
-      const endY = Math.min(Math.max(0, ev.clientY - rect.top), rect.height);
-      const w = Math.abs(endX-startX), h=Math.abs(endY-startY);
-      const l = Math.min(endX,startX), t = Math.min(endY,startY);
-      if(w<4||h<4){ return; }
-      if(tool==='whiteout'){
-        const op=+document.getElementById('opacity').value/100;
-        createObject('rect', pageIdx, pt(l), pt(t), pt(w), pt(h), {fill:'#ffffff', stroke:null, opacity:op, mode:'whiteout'});
-      } else if(tool==='highlight'){
-        const op=+document.getElementById('opacity').value/100;
-        createObject('rect', pageIdx, pt(l), pt(t), pt(w), pt(h), {fill:'#fff38a', stroke:null, opacity:op, mode:'highlight'});
-      } else if(tool==='link'){
-        const url = prompt('Link URL (https://...)'); if(!url) return;
-        createObject('link', pageIdx, pt(l), pt(t), pt(w), pt(h), {url});
-      } else if(tool==='image' || tool==='sign'){
-        const inp = document.createElement('input'); inp.type='file'; inp.accept='image/*'; inp.onchange=async ()=>{
-          const f = inp.files[0]; if(!f) return;
-          const b = await f.arrayBuffer(); const b64 = 'data:'+f.type+';base64,'+ btoa(String.fromCharCode(...new Uint8Array(b)));
-          createObject('image', pageIdx, pt(l), pt(t), pt(w), pt(h), {src: b64, opacity:1});
-        }; inp.click();
-      } else if(tool==='draw'){
-        // simple rectangle draw as placeholder for a stroke
-        const color=document.getElementById('color').value; const op=+document.getElementById('opacity').value/100;
-        createObject('stroke', pageIdx, pt(l), pt(t), pt(w), pt(h), {color, opacity:op, points:[]});
-      } else if(tool==='crop'){
-        // set page crop rect (single per page)
-        const pg=pages[pageIdx]; pg.crop = {x:pt(l), y:pt(t), w:pt(w), h:pt(h)}; pushHistory(); alert('Crop set for this page. Will apply on save.');
-      }
-    }
-    pgWrap.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
-  }
-});
-
-// rotate / delete current page
- document.getElementById('rotateL').onclick = ()=>{ pages[currentPage].rot = ((pages[currentPage].rot||0) - 90) % 360; pushHistory(); alert('Rotation will apply on save.'); };
- document.getElementById('rotateR').onclick = ()=>{ pages[currentPage].rot = ((pages[currentPage].rot||0) + 90) % 360; pushHistory(); alert('Rotation will apply on save.'); };
- document.getElementById('deletePg').onclick = ()=>{ pages[currentPage].deleted = !pages[currentPage].deleted; pushHistory(); alert(pages[currentPage].deleted? 'Page marked for deletion' : 'Deletion undone'); };
-
-// Undo / Redo
- document.getElementById('undo').onclick = ()=>{ if(history.length){ const s=history.pop(); redoStack.push(s); if(history.length){ restoreState(history[history.length-1]); } } };
- document.getElementById('redo').onclick = ()=>{ if(redoStack.length){ const s=redoStack.pop(); history.push(s); restoreState(s); } };
-
-// Key shortcuts
- document.addEventListener('keydown', (e)=>{
-   if ((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='z'){ e.preventDefault(); document.getElementById('undo').click(); }
-   if ((e.ctrlKey||e.metaKey) && (e.key.toLowerCase()==='y' || (e.shiftKey && e.key.toLowerCase()==='z'))){ e.preventDefault(); document.getElementById('redo').click(); }
-   if (e.key==='Delete' && selId){ objects = objects.filter(o=>o.id!==selId); const el=document.querySelector(`.handle[data-id='${selId}']`); if(el) el.remove(); selId=null; pushHistory(); }
- });
-
-// Apply: send to server
- document.getElementById('apply').onclick = async ()=>{
-   if(!pdfBytes){ alert('Upload a PDF first.'); return; }
-   const ops = {
-     page_order: pageOrder,
-     deletes: pages.map((p,i)=>p.deleted?i:null).filter(v=>v!==null),
-     rotations: pages.map((p,i)=> p.rot? {page:i, deg:p.rot}: null).filter(Boolean),
-     crops: pages.map((p,i)=> p.crop? {page:i, **p.crop}: null).filter(Boolean),
-     objects
-   };
-   const fd = new FormData();
-   fd.append('pdf', new Blob([pdfBytes], {type:'application/pdf'}), 'input.pdf');
-   fd.append('ops', JSON.stringify(ops));
-   const res = await fetch('/apply', {method:'POST', body: fd});
-   if(!res.ok){ const t=await res.text(); alert('Failed: '+t); return; }
-   const blob = await res.blob();
-   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'edited.pdf'; a.click();
- };
-
-function renderEverything(){
-  document.querySelectorAll('.handle').forEach(n=>n.remove());
-  objects.forEach(drawHandle);
-  // thumbs active state
-  document.querySelectorAll('.thumb').forEach(d=>d.classList.toggle('active', +d.dataset.pg===currentPage));
-}
-
+  // helpers
+  function qs(sel, root=document){return root.querySelector(sel)}
+  function qsa(sel, root=document){return [...root.querySelectorAll(sel)]}
 </script>
 </body>
 </html>
 """
 
-# --------------------- Helpers (server) ---------------------
+INDEX_HTML = r"""
+{% extends "base.html" %}
+{% block body %}
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <div class="card text-bg-dark border-0 shadow">
+      <div class="card-body p-5">
+        <h1 class="h3 mb-3">Edit PDF files online</h1>
+        <p class="text-secondary mb-4">Rotate, delete, reorder pages, or add quick text overlays. Private – files auto-delete soon after editing.</p>
 
-def _hex_to_rgb(hex_color: str) -> Tuple[float, float, float]:
-    hex_color = hex_color.strip()
-    if hex_color.startswith('#'):
-        hex_color = hex_color[1:]
-    if len(hex_color) == 3:
-        hex_color = ''.join(c*2 for c in hex_color)
-    r = int(hex_color[0:2], 16)/255.0
-    g = int(hex_color[2:4], 16)/255.0
-    b = int(hex_color[4:6], 16)/255.0
-    return (r, g, b)
+        <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="d-flex gap-3 align-items-center">
+          <input class="form-control form-control-lg" type="file" name="file" accept="application/pdf" required>
+          <button class="btn btn-primary btn-lg">Upload</button>
+        </form>
 
-# --------------------- Routes ---------------------
+        <hr class="my-4">
+        <p class="small text-secondary mb-0">
+          Tip: For large documents, edits happen server-side using <code>PyMuPDF</code> for speed and fidelity.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+"""
 
-@app.get("/")
+WORK_HTML = r"""
+{% extends "base.html" %}
+{% block body %}
+<div class="row g-4">
+  <div class="col-lg-3">
+    <div class="sidebar">
+      <div class="card text-bg-dark border-0 shadow mb-3">
+        <div class="card-body">
+          <h2 class="h5 mb-3">Document</h2>
+          <div class="small text-secondary">File: {{ filename }}</div>
+          <div class="small text-secondary">Pages: <span id="pageCount">{{ page_count }}</span></div>
+          <div class="d-grid mt-3 gap-2">
+            <a class="btn btn-outline-light" href="{{ url_for('download_pdf', doc_id=doc_id) }}" target="_blank">Open PDF</a>
+            <a class="btn btn-success" href="{{ url_for('export_pdf', doc_id=doc_id) }}">Download</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="card text-bg-dark border-0 shadow">
+        <div class="card-body">
+          <h2 class="h5 mb-3">Actions on selection</h2>
+          <div class="btn-group d-flex gap-2 flex-wrap">
+            <button class="btn btn-primary flex-fill" onclick="rotate(90)">Rotate 90°</button>
+            <button class="btn btn-primary flex-fill" onclick="rotate(270)">Rotate -90°</button>
+            <button class="btn btn-warning flex-fill" onclick="deletePages()">Delete</button>
+          </div>
+
+          <hr class="my-3">
+          <h2 class="h6">Reorder</h2>
+          <p class="small text-secondary mb-2">Drag to re-order, then apply.</p>
+          <div class="d-flex gap-2">
+            <button class="btn btn-outline-light btn-sm" onclick="enableReorder(true)">Start reorder</button>
+            <button class="btn btn-success btn-sm" onclick="applyReorder()">Apply</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="enableReorder(false)">Cancel</button>
+          </div>
+
+          <hr class="my-3">
+          <h2 class="h6">Add quick text</h2>
+          <div class="small text-secondary mb-2">Adds text at top-left of each selected page.</div>
+          <input id="txtText" class="form-control form-control-sm mb-2" placeholder="Text">
+          <div class="row g-2">
+            <div class="col-6"><input id="txtSize" type="number" class="form-control form-control-sm" value="14" min="6" max="64"></div>
+            <div class="col-6"><input id="txtColor" type="color" class="form-control form-control-sm" value="#000000"></div>
+          </div>
+          <button class="btn btn-outline-light btn-sm mt-2" onclick="addText()">Add text</button>
+        </div>
+      </div>
+
+      <div class="card text-bg-dark border-0 shadow mt-3">
+        <div class="card-body">
+          <h2 class="h6">Merge another PDF</h2>
+          <input id="mergeInput" type="file" accept="application/pdf" class="form-control form-control-sm mb-2">
+          <button class="btn btn-outline-light btn-sm" onclick="merge()">Merge</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="col-lg-9">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h2 class="h5 mb-0">Pages</h2>
+      <div class="small text-secondary">Click to select. Hold Ctrl/Cmd to multi-select.</div>
+    </div>
+
+    <div id="grid" class="row g-3"></div>
+  </div>
+</div>
+
+<script>
+const DOC_ID = "{{ doc_id }}";
+let pageCount = {{ page_count }};
+let reorderMode = false;
+
+function api(url, data){
+  return fetch(url, {
+    method:"POST", headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(data||{})
+  }).then(r=>r.json());
+}
+
+function selectedPages(){
+  return qsa('.page-tile.selected').map(el=>parseInt(el.dataset.page));
+}
+
+function buildGrid(){
+  const grid = qs('#grid'); grid.innerHTML='';
+  for(let p=1;p<=pageCount;p++){
+    const col = document.createElement('div');
+    col.className = 'col-6 col-md-4 col-lg-3';
+    col.innerHTML = `
+      <div class="thumb page-tile" data-page="${p}" draggable="${reorderMode}">
+        <img loading="lazy" src="/preview/${DOC_ID}/${p}?t=${Date.now()}">
+        <div class="p-2 small text-center text-secondary">Page ${p}</div>
+      </div>`;
+    grid.appendChild(col);
+  }
+  qsa('.page-tile').forEach(tile=>{
+    tile.addEventListener('click', e=>{
+      if(!reorderMode){
+        if(e.metaKey||e.ctrlKey){ tile.classList.toggle('selected') }
+        else{
+          qsa('.page-tile.selected').forEach(t=>t.classList.remove('selected'));
+          tile.classList.add('selected');
+        }
+      }
+    });
+
+    tile.addEventListener('dragstart', e=>{
+      if(!reorderMode) return;
+      e.dataTransfer.setData('text/plain', tile.dataset.page);
+      tile.classList.add('selected');
+    });
+    tile.addEventListener('dragover', e=>{ if(reorderMode){ e.preventDefault(); } });
+    tile.addEventListener('drop', e=>{
+      if(!reorderMode) return;
+      e.preventDefault();
+      const from = parseInt(e.dataTransfer.getData('text/plain'));
+      const to = parseInt(tile.dataset.page);
+      reorderDom(from, to);
+    });
+  });
+}
+
+function reorderDom(from, to){
+  // re-number the tiles visually
+  const tiles = qsa('.page-tile');
+  const order = tiles.map(t=>parseInt(t.dataset.page));
+  const idxFrom = order.indexOf(from);
+  const idxTo = order.indexOf(to);
+  order.splice(idxTo,0, order.splice(idxFrom,1)[0]);
+  // rebuild grid with new order labels
+  pageCount = order.length;
+  const grid = qs('#grid'); grid.innerHTML='';
+  order.forEach(p=>{
+    const col = document.createElement('div');
+    col.className = 'col-6 col-md-4 col-lg-3';
+    col.innerHTML = `
+      <div class="thumb page-tile" data-page="${p}" draggable="${reorderMode}">
+        <img loading="lazy" src="/preview/${DOC_ID}/${p}?t=${Date.now()}">
+        <div class="p-2 small text-center text-secondary">Page ${p}</div>
+      </div>`;
+    grid.appendChild(col);
+  });
+  // reattach handlers
+  buildGrid();
+}
+
+function enableReorder(on){
+  reorderMode = !!on;
+  buildGrid();
+}
+
+function refresh(){
+  return fetch(`/api/info/${DOC_ID}`).then(r=>r.json()).then(j=>{
+    pageCount = j.page_count;
+    qs('#pageCount').textContent = pageCount;
+    buildGrid();
+  });
+}
+
+async function rotate(angle){
+  const pages = selectedPages();
+  if(pages.length===0){ alert('Select page(s) first'); return; }
+  await api(`/op/rotate/${DOC_ID}`, {pages, angle});
+  await refresh();
+}
+
+async function deletePages(){
+  const pages = selectedPages();
+  if(pages.length===0){ alert('Select page(s) first'); return; }
+  if(!confirm('Delete selected pages?')) return;
+  await api(`/op/delete/${DOC_ID}`, {pages});
+  await refresh();
+}
+
+async function applyReorder(){
+  const order = qsa('.page-tile').map(el=>parseInt(el.dataset.page));
+  await api(`/op/reorder/${DOC_ID}`, {order});
+  reorderMode=false;
+  await refresh();
+}
+
+async function addText(){
+  const pages = selectedPages();
+  if(pages.length===0){ alert('Select page(s) first'); return; }
+  const text = qs('#txtText').value.trim();
+  if(!text){ alert('Enter some text'); return; }
+  const size = parseInt(qs('#txtSize').value||'14');
+  const color = qs('#txtColor').value; // "#rrggbb"
+  await api(`/op/text/${DOC_ID}`, {pages, text, size, color});
+  await refresh();
+}
+
+async function merge(){
+  const inp = qs('#mergeInput');
+  if(!inp.files.length) return alert('Choose a PDF to merge');
+  const fd = new FormData();
+  fd.append('file', inp.files[0]);
+  const r = await fetch(`/op/merge/${DOC_ID}`, {method:'POST', body: fd});
+  const j = await r.json();
+  if(j.ok) { await refresh(); inp.value=''; }
+  else alert(j.error||'Merge failed');
+}
+
+buildGrid();
+</script>
+{% endblock %}
+"""
+
+# ----------------- Template registration -----------------
+@app.context_processor
+def inject_templates():
+    return {}
+
+@app.route("/")
 def index():
-    return render_template_string(PAGE, app_name=APP_NAME)
+    return render_template_string(INDEX_HTML,)
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files.get("file")
+    if not f or not f.filename.lower().endswith(".pdf"):
+        return redirect(url_for("index"))
+    doc_id = uuid.uuid4().hex
+    dest = os.path.join(TMP_DIR, f"{doc_id}.pdf")
+    f.save(dest)
+    OPEN_DOCS[doc_id] = dest
+    session["last_doc"] = doc_id
+    return redirect(url_for("work", doc_id=doc_id))
 
-@app.post("/apply")
-def apply_changes():
-    """Accepts multipart form: 'pdf' (file) and 'ops' (JSON string).
-    Applies operations to the PDF using PyMuPDF and returns the edited PDF.
-    """
-    if 'pdf' not in request.files:
-        return ("No PDF uploaded", 400)
-    try:
-        ops = json.loads(request.form.get('ops', '{}'))
-    except Exception as e:
-        return (f"Invalid ops JSON: {e}", 400)
+@app.route("/work/<doc_id>")
+def work(doc_id):
+    path = OPEN_DOCS.get(doc_id)
+    if not path or not os.path.exists(path):
+        abort(404)
+    with fitz.open(path) as doc:
+        page_count = doc.page_count
+    filename = os.path.basename(path)
+    return render_template_string(
+        WORK_HTML, doc_id=doc_id, page_count=page_count, filename=filename
+    )
 
-    src_bytes = request.files['pdf'].read()
-    try:
-        doc = fitz.open(stream=src_bytes, filetype='pdf')
-    except Exception as e:
-        return (f"Cannot open PDF: {e}", 400)
+# ----------------- Utility functions -----------------
+def _path(doc_id: str) -> str:
+    p = OPEN_DOCS.get(doc_id)
+    if not p or not os.path.exists(p):
+        abort(404)
+    return p
 
-    # --- Page reorder / delete ---
-    n = len(doc)
-    page_order = ops.get('page_order') or list(range(n))
-    deletes = set(ops.get('deletes') or [])
-    # Build a select list: keep pages in this order and not deleted
-    keep = [p for p in page_order if (0 <= p < n) and (p not in deletes)]
-    try:
+def _as_list(pages: List[int], page_count: int) -> List[int]:
+    # pages are 1-based from UI, validate & convert to 0-based unique ascending
+    uniq = sorted({p for p in pages if 1 <= int(p) <= page_count})
+    return [p-1 for p in uniq]
+
+def _atomic_save(modifier, src: str):
+    """Open PDF, apply modifier(doc), save atomically."""
+    tmp_out = f"{src}.new.pdf"
+    with fitz.open(src) as doc:
+        modifier(doc)
+        doc.save(tmp_out, deflate=True)
+    os.replace(tmp_out, src)
+
+# ----------------- Info & preview -----------------
+@app.route("/api/info/<doc_id>")
+def info(doc_id):
+    path = _path(doc_id)
+    with fitz.open(path) as doc:
+        return jsonify({"page_count": doc.page_count})
+
+@app.route("/preview/<doc_id>/<int:page>")
+def preview(doc_id, page: int):
+    path = _path(doc_id)
+    with fitz.open(path) as doc:
+        if not (1 <= page <= doc.page_count): abort(404)
+        pix = doc[page-1].get_pixmap(dpi=90, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    bio = io.BytesIO()
+    img.save(bio, format="PNG", optimize=True)
+    bio.seek(0)
+    return send_file(bio, mimetype="image/png", max_age=0)
+
+@app.route("/pdf/<doc_id>")
+def download_pdf(doc_id):
+    path = _path(doc_id)
+    return send_file(path, mimetype="application/pdf")
+
+@app.route("/export/<doc_id>")
+def export_pdf(doc_id):
+    path = _path(doc_id)
+    fn = f"oneplacepdf_{doc_id}.pdf"
+    return send_file(path, as_attachment=True, download_name=fn, mimetype="application/pdf")
+
+# ----------------- Operations -----------------
+@app.route("/op/rotate/<doc_id>", methods=["POST"])
+def op_rotate(doc_id):
+    path = _path(doc_id)
+    body = request.get_json(force=True, silent=True) or {}
+    angle = int(body.get("angle", 90)) % 360
+    with fitz.open(path) as d: page_count = d.page_count
+    pages = _as_list(body.get("pages", []), page_count)
+
+    def modifier(doc):
+        for p in pages:
+            pg = doc[p]
+            new = (pg.rotation + angle) % 360
+            pg.set_rotation(new)
+
+    _atomic_save(modifier, path)
+    return jsonify(ok=True)
+
+@app.route("/op/delete/<doc_id>", methods=["POST"])
+def op_delete(doc_id):
+    path = _path(doc_id)
+    body = request.get_json(force=True, silent=True) or {}
+    with fitz.open(path) as d: page_count = d.page_count
+    pages = _as_list(body.get("pages", []), page_count)
+
+    def modifier(doc):
+        # delete_pages accepts ranges string or list (1-based)
+        keep = [i for i in range(doc.page_count) if i not in pages]
         doc.select(keep)
-    except Exception:
-        # fallback: manually copy into new doc
-        ndoc = fitz.open()
-        for i in keep:
-            ndoc.insert_pdf(doc, from_page=i, to_page=i)
-        doc.close(); doc = ndoc
 
-    # --- Rotations ---
-    for item in (ops.get('rotations') or []):
-        try:
-            p = int(item.get('page')); deg = int(item.get('deg')) % 360
-            if 0 <= p < len(doc):
-                pg = doc[p]
-                pg.set_rotation(deg)
-        except Exception:
-            pass
+    _atomic_save(modifier, path)
+    return jsonify(ok=True)
 
-    # --- Crops ---
-    for item in (ops.get('crops') or []):
-        try:
-            p = int(item.get('page'))
-            r = fitz.Rect(item['x'], item['y'], item['x']+item['w'], item['y']+item['h'])
-            if 0 <= p < len(doc):
-                doc[p].set_cropbox(r)
-        except Exception:
-            pass
+@app.route("/op/reorder/<doc_id>", methods=["POST"])
+def op_reorder(doc_id):
+    path = _path(doc_id)
+    body = request.get_json(force=True, silent=True) or {}
+    order_1based = body.get("order", [])
+    with fitz.open(path) as d: page_count = d.page_count
 
-    # --- Draw objects ---
-    for obj in (ops.get('objects') or []):
-        try:
-            p = int(obj.get('page'))
-            if not (0 <= p < len(doc)): continue
-            page = doc[p]
-            x, y, w, h = float(obj['x']), float(obj['y']), float(obj['w']), float(obj['h'])
-            rect = fitz.Rect(x, y, x+w, y+h)
-            t = obj.get('type')
-            props = obj.get('props', {})
-            rot = float(obj.get('rotate') or 0)
+    # UI sends an order based on current page labels (1..N). Convert to 0-based.
+    order = [p-1 for p in order_1based if 1 <= p <= page_count]
+    if len(order) != page_count:
+        return jsonify(ok=False, error="Invalid order length"), 400
 
-            if t == 'text':
-                text = props.get('text','')
-                color = _hex_to_rgb(props.get('color', '#000000'))
-                size = float(props.get('size', 16))
-                font = props.get('font','helv')  # helv / times / cour
-                opacity = float(props.get('opacity', 1.0))
-                page.insert_textbox(rect, text, fontsize=size, fontname=font, color=color, align=0, rotate=rot, fill_opacity=opacity)
+    def modifier(doc):
+        doc.select(order)
 
-            elif t == 'rect':
-                fill = props.get('fill'); stroke = props.get('stroke')
-                opacity = float(props.get('opacity', 1.0))
-                shape = page.new_shape()
-                shape.draw_rect(rect)
-                sc = _hex_to_rgb(stroke) if stroke else None
-                fc = _hex_to_rgb(fill) if fill else None
-                shape.finish(color=sc, fill=fc)
-                shape.commit(overlay=True, fill_opacity=opacity, stroke_opacity=opacity)
+    _atomic_save(modifier, path)
+    return jsonify(ok=True)
 
-            elif t == 'image':
-                src = props.get('src','')
-                opacity = float(props.get('opacity', 1.0))
-                if src.startswith('data:'):
-                    b64 = src.split(',')[1]
-                    img_bytes = base64.b64decode(b64)
-                else:
-                    img_bytes = b''
-                page.insert_image(rect, stream=img_bytes, rotate=rot, keep_proportion=False, overlay=True, opacity=opacity)
+def hex_to_rgb(hx: str):
+    hx = hx.lstrip("#")
+    return tuple(int(hx[i:i+2], 16)/255 for i in (0,2,4))
 
-            elif t == 'stroke':
-                color = _hex_to_rgb(props.get('color','#000000'))
-                opacity = float(props.get('opacity',1.0))
-                shape = page.new_shape()
-                # If points exist, draw polyline; otherwise draw rect placeholder
-                pts = props.get('points') or []
-                if pts:
-                    shape.draw_polyline([fitz.Point(xx,yy) for (xx,yy) in pts])
-                else:
-                    shape.draw_rect(rect)
-                shape.finish(color=color, fill=None, width=1)
-                shape.commit(overlay=True, stroke_opacity=opacity)
+@app.route("/op/text/<doc_id>", methods=["POST"])
+def op_text(doc_id):
+    path = _path(doc_id)
+    body = request.get_json(force=True, silent=True) or {}
+    text = (body.get("text") or "").strip()
+    size = int(body.get("size") or 14)
+    color = hex_to_rgb(body.get("color") or "#000000")
 
-            elif t == 'link':
-                url = props.get('url','')
-                if url:
-                    page.insert_link({"kind": fitz.LINK_URI, "from": rect, "uri": url})
-        except Exception:
-            # continue safely
-            pass
+    with fitz.open(path) as d: page_count = d.page_count
+    pages = _as_list(body.get("pages", []), page_count)
+    if not text:
+        return jsonify(ok=False, error="Empty text"), 400
 
-    # --- Optional: find & replace (overlay approach) ---
-    # In case front-end supplies: {find: "word", replace: "new"}
-    fr = ops.get('find_replace')
-    if fr and isinstance(fr, dict):
-        term = fr.get('find','')
-        repl = fr.get('replace','')
-        if term:
-            for p in range(len(doc)):
-                try:
-                    inst = doc[p].search_for(term)
-                except Exception:
-                    inst = []
-                for r in inst:
-                    # whiteout area then print replacement roughly centered
-                    shape = doc[p].new_shape(); shape.draw_rect(r); shape.finish(fill=(1,1,1)); shape.commit()
-                    doc[p].insert_textbox(r, repl, fontsize=12, fontname='helv', color=(0,0,0), align=1)
+    def modifier(doc):
+        for p in pages:
+            pg = doc[p]
+            # add at 36pt from top-left; use text insertion (device units)
+            pg.insert_text((36, 36+size), text, fontsize=size, color=color)
 
-    # --- Final save ---
-    out = io.BytesIO()
-    doc.save(out, deflate=True, garbage=4, clean=True, linear=True)
-    doc.close(); out.seek(0)
-    return send_file(out, as_attachment=True, download_name='edited.pdf', mimetype='application/pdf')
+    _atomic_save(modifier, path)
+    return jsonify(ok=True)
 
+@app.route("/op/merge/<doc_id>", methods=["POST"])
+def op_merge(doc_id):
+    path = _path(doc_id)
+    f = request.files.get("file")
+    if not f or not f.filename.lower().endswith(".pdf"):
+        return jsonify(ok=False, error="Upload a PDF"), 400
+    tmp = os.path.join(TMP_DIR, f"merge-{uuid.uuid4().hex}.pdf")
+    f.save(tmp)
+
+    def modifier(doc):
+        with fitz.open(tmp) as other:
+            doc.insert_pdf(other)
+
+    try:
+        _atomic_save(modifier, path)
+        return jsonify(ok=True)
+    finally:
+        try: os.remove(tmp)
+        except: pass
+
+# ----------------- Jinja base registration -----------------
+@app.before_request
+def _ensure_templates():
+    # Register base once per process
+    app.jinja_env.globals["bootstrap_loaded"] = True
+    app.jinja_loader = app.create_global_jinja_loader()
+    app.jinja_env.from_string(BASE_HTML).stream().dump  # touch to ensure env ok
+
+@app.route("/__templates__/base.html")
+def _base_ref():
+    return render_template_string(BASE_HTML)
+
+# Tell Jinja how to find base.html from the string
+from jinja2 import DictLoader
+app.jinja_loader = DictLoader({"base.html": BASE_HTML})
+
+# --------------- Health ---------------
+@app.get("/healthz")
+def health():
+    return "ok", 200
+
+# --------------- Local run ---------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=8000, debug=True)

@@ -5,3 +5,4 @@ Jinja2==3.1.4
 PyMuPDF==1.24.6
 boto3==1.34.162
 python-dotenv==1.0.1
+gunicorn==22.0.0

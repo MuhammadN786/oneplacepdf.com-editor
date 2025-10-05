@@ -1,6 +1,5 @@
 # app.py — Mini PDF Editor (Flask + PyMuPDF)
-# Final version: textbox fix, signature stability, selection/move/resize, tick/cross,
-# undo/redo, help pages, JSON-only errors, safe rect guards, highlight fallbacks.
+# Final: solid Undo/Redo, on-canvas Delete/Duplicate UI, textbox fixes, signature stability.
 #
 # requirements.txt
 # Flask==3.0.3
@@ -96,14 +95,12 @@ def _clip_rect(r: fitz.Rect, page_rect: fitz.Rect) -> fitz.Rect:
     return fitz.Rect(x0, y0, x1, y1)
 
 def _ensure_min_rect(r: fitz.Rect, page_rect: fitz.Rect, min_w=2.0, min_h=2.0) -> fitz.Rect:
-    # Expand around center if too small, then clip to page
     cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
     if r.width < min_w:
         r.x0, r.x1 = cx - min_w / 2, cx + min_w / 2
     if r.height < min_h:
         r.y0, r.y1 = cy - min_h / 2, cy + min_h / 2
     r = _clip_rect(r, page_rect)
-    # Guard against accidental inversion after clip
     if r.width <= 0 or r.height <= 0:
         r = fitz.Rect(cx - min_w / 2, cy - min_h / 2, cx + min_w / 2, cy + min_h / 2)
         r = _clip_rect(r, page_rect)
@@ -136,6 +133,13 @@ INDEX_HTML = r"""
     .card.bg-dark { background:#0f1428 !important; }
     label.small-label { font-size:.85rem; color:#aeb7d6; }
     .brand { user-select:none }
+    /* Selection mini-toolbar */
+    #selToolbar {
+      position:absolute; display:none; z-index:3;
+      background:#0f1428; border:1px solid #2a355d; border-radius:10px; padding:6px;
+      box-shadow:0 6px 16px rgba(0,0,0,.35);
+    }
+    #selToolbar .btn { padding:.15rem .5rem; }
   </style>
 </head>
 <body>
@@ -147,8 +151,6 @@ INDEX_HTML = r"""
     <button id="btnUndoServer" class="btn btn-outline-warning">Rollback (server)</button>
     <a href="/help" target="_blank" class="btn btn-outline-info">How to use</a>
     <a href="/shortcuts" target="_blank" class="btn btn-outline-secondary">Shortcuts</a>
-    <button class="btn btn-info" data-bs-toggle="modal" data-bs-target="#helpModal">Quick help</button>
-    <button class="btn btn-secondary" data-bs-toggle="modal" data-bs-target="#shortcutsModal">Quick shortcuts</button>
   </div>
 
   <div class="row g-3">
@@ -216,6 +218,12 @@ INDEX_HTML = r"""
       <div id="canvasWrap" class="rounded-3 shadow">
         <img id="pageImg" src="" />
         <canvas id="overlay"></canvas>
+
+        <!-- selection mini-toolbar -->
+        <div id="selToolbar" class="btn-group">
+          <button id="btnDup" class="btn btn-sm btn-outline-light" title="Duplicate">Duplicate</button>
+          <button id="btnDel" class="btn btn-sm btn-danger" title="Delete">Delete</button>
+        </div>
       </div>
     </div>
   </div>
@@ -242,61 +250,6 @@ INDEX_HTML = r"""
   </div>
 </div>
 
-<!-- Quick Help Modal -->
-<div class="modal fade" id="helpModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
-    <div class="modal-content bg-dark text-light border-secondary">
-      <div class="modal-header">
-        <h5 class="modal-title">How to use</h5>
-        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <ol>
-          <li><strong>Upload</strong> a PDF with the file picker (top-left). Thumbnails appear on the left.</li>
-          <li>Click a <strong>thumbnail</strong> to switch pages. Use the <strong>Zoom</strong> slider if needed.</li>
-          <li>Choose a <strong>tool</strong> in the toolbar. Drag on the page to place it:
-            <ul>
-              <li><em>Highlight / Strikeout / Rect / Circle</em>: drag to create a box.</li>
-              <li><em>Line / Arrow</em>: drag from start to end.</li>
-              <li><em>Freehand</em>: click-drag to draw.</li>
-              <li><em>Text Box</em>: drag a box; type the text when prompted. Use <strong>Font</strong> and <strong>Size</strong> to style.</li>
-              <li><em>Signature</em>: click <strong>Signature</strong>, draw in the pad, “Use Signature”, then drag to place it.</li>
-              <li><em>Tick / Cross</em>: drag a small box over a checkbox.</li>
-            </ul>
-          </li>
-          <li><strong>Select & edit</strong>: Click any item to select. Drag inside to move. Drag corner handles to resize.
-              For lines/arrows, drag the endpoints. Double-click a textbox to edit its text.</li>
-          <li><strong>Delete</strong> selected item with the <kbd>Delete</kbd>/<kbd>Backspace</kbd> key.</li>
-          <li><strong>Undo/Redo</strong> with the buttons or <kbd>Ctrl/⌘+Z</kbd> / <kbd>Ctrl/⌘+Y</kbd>.</li>
-          <li>Click <strong>Save Edits</strong> to write changes into the PDF. Then <strong>Download</strong>.</li>
-          <li>If something goes wrong, use <strong>Rollback (server)</strong> to revert to the previous saved version.</li>
-        </ol>
-        <p class="small text-secondary m-0">A full page is available at <a href="/help" target="_blank">/help</a> and shortcuts at <a href="/shortcuts" target="_blank">/shortcuts</a>.</p>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Quick Shortcuts Modal -->
-<div class="modal fade" id="shortcutsModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog">
-    <div class="modal-content bg-dark text-light border-secondary">
-      <div class="modal-header">
-        <h5 class="modal-title">Keyboard shortcuts</h5>
-        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <ul class="mb-0">
-          <li><span class="kbd">H</span>/<span class="kbd">S</span>/<span class="kbd">R</span>/<span class="kbd">C</span>/<span class="kbd">L</span>/<span class="kbd">A</span>/<span class="kbd">I</span>/<span class="kbd">T</span>/<span class="kbd">G</span> — select tool</li>
-          <li><span class="kbd">Ctrl/⌘+Z</span> Undo, <span class="kbd">Ctrl/⌘+Y</span> Redo</li>
-          <li><span class="kbd">Delete</span>/<span class="kbd">Backspace</span> delete selected</li>
-          <li><span class="kbd">Esc</span> clear selection</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-</div>
-
 <script>
 (() => {
   let docId = null, currentPage = 0, totalPages = 0, zoom = 1.2;
@@ -314,6 +267,8 @@ INDEX_HTML = r"""
   const toolbarBtns = [...document.querySelectorAll('[data-tool]')];
   const pageImg = el('pageImg');
   const overlay = el('overlay');
+  const canvasWrap = document.getElementById('canvasWrap');
+  const selToolbar = el('selToolbar'), btnDup = el('btnDup'), btnDel = el('btnDel');
 
   // image cache to prevent signature flicker
   const imgCache = new Map();
@@ -339,7 +294,7 @@ INDEX_HTML = r"""
     });
   });
 
-  // Shortcuts
+  // Shortcuts & delete
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     const map = { h:'highlight', s:'strikeout', r:'rect', c:'circle', l:'line', a:'arrow', i:'ink', t:'textbox', g:'signature' };
@@ -350,27 +305,30 @@ INDEX_HTML = r"""
     if ((e.ctrlKey||e.metaKey) && k==='z') { undo(); }
     if ((e.ctrlKey||e.metaKey) && k==='y') { redo(); }
     if ((k === 'delete' || k === 'backspace') && state.sel) { deleteSelected(); e.preventDefault(); }
-    if (k === 'escape') { state.sel = null; redrawOverlay(); }
+    if (k === 'escape') { clearSelection(); }
   });
 
   // Style controls
-  el('color').addEventListener('input', e => state.color = e.target.value);
-  el('thickness').addEventListener('input', e => state.thickness = +e.target.value);
+  el('color').addEventListener('input', e => { state.color = e.target.value; if (state.sel) { applyColorToSelection(); }});
+  el('thickness').addEventListener('input', e => { state.thickness = +e.target.value; if (state.sel) { applyThicknessToSelection(); }});
   el('fontFamily').addEventListener('change', e => {
-    state.fontFamily = e.target.value;
-    if (state.sel) applyTextStyleToSelection();
+    state.fontFamily = e.target.value; if (state.sel) applyTextStyleToSelection();
   });
   el('fontSize').addEventListener('input', e => {
-    state.fontSize = +e.target.value;
-    if (state.sel) applyTextStyleToSelection();
+    state.fontSize = +e.target.value; if (state.sel) applyTextStyleToSelection();
   });
+
+  function applyColorToSelection(){
+    const s = state.sel; if (!s) return; const a = state.stack[s.index];
+    if (!a) return; a.colorHex = state.color; a.color = hexToRgb(state.color); snapshot(); redrawOverlay();
+  }
+  function applyThicknessToSelection(){
+    const s = state.sel; if (!s) return; const a = state.stack[s.index];
+    if (!a) return; a.thickness = state.thickness; snapshot(); redrawOverlay();
+  }
   function applyTextStyleToSelection(){
-    const s = state.sel; if (!s) return;
-    const a = state.stack[s.index];
-    if (a && a.type === 'textbox') {
-      a.font = state.fontFamily; a.font_size = state.fontSize;
-      snapshot(); redrawOverlay();
-    }
+    const s = state.sel; if (!s) return; const a = state.stack[s.index];
+    if (a && a.type === 'textbox') { a.font = state.fontFamily; a.font_size = state.fontSize; snapshot(); redrawOverlay(); }
   }
 
   el('zoom').addEventListener('input', e => { zoom = +e.target.value; renderPage(); });
@@ -393,7 +351,7 @@ INDEX_HTML = r"""
 
   function resetStacks(){
     state.stack = []; state.history = []; state.historyIdx = -1; snapshot();
-    state.sel = null;
+    clearSelection();
   }
 
   // Download / Rollback
@@ -419,13 +377,13 @@ INDEX_HTML = r"""
   function undo() {
     if (state.historyIdx > 0) {
       state.historyIdx--; state.stack = JSON.parse(state.history[state.historyIdx]);
-      state.sel = null; redrawOverlay();
+      clearSelection(); redrawOverlay();
     }
   }
   function redo() {
     if (state.historyIdx < state.history.length - 1) {
       state.historyIdx++; state.stack = JSON.parse(state.history[state.historyIdx]);
-      state.sel = null; redrawOverlay();
+      clearSelection(); redrawOverlay();
     }
   }
 
@@ -493,8 +451,9 @@ INDEX_HTML = r"""
     const hit = hitTestAt(pt.x, pt.y);
     if (hit) {
       state.sel = hit; state.draggingSel = true; state.sel.startMouse = [pt.x, pt.y];
-      snapshotStartForSel(); return;
+      snapshotStartForSel(); updateSelToolbar(); return;
     }
+    clearSelection();
     if (!state.tool) return;
     state.drawing = true; state.start = [pt.x, pt.y];
     if (state.tool === 'ink') state.stroke = [[pt.x, pt.y]];
@@ -513,7 +472,7 @@ INDEX_HTML = r"""
 
   overlay.addEventListener('mouseup', (e) => {
     const pt = rel(e);
-    if (state.draggingSel && state.sel) { state.draggingSel = false; snapshot(); return; }
+    if (state.draggingSel && state.sel) { state.draggingSel = false; snapshot(); updateSelToolbar(); return; }
     if (!state.drawing) return;
     state.drawing = false;
 
@@ -555,6 +514,7 @@ INDEX_HTML = r"""
       ctx.stroke();
     }
     if (state.sel && state.sel.page === currentPage) drawSelection(ctx, state.stack[state.sel.index], state.sel);
+    updateSelToolbar(); // position/hide toolbar
   }
 
   function drawLocal(ctx, a, isPreview=false) {
@@ -603,9 +563,7 @@ INDEX_HTML = r"""
       const r = a.rect; const img = getImageCached(a.previewDataURL);
       if (img && img.complete && img.naturalWidth) {
         ctx.drawImage(img, r[0], r[1], r[2]-r[0], r[3]-r[1]);
-      } else if (img) {
-        img.onload = () => requestAnimationFrame(redrawOverlay);
-      }
+      } else if (img) { img.onload = () => requestAnimationFrame(redrawOverlay); }
 
     } else if (a.type === 'tick' || a.type === 'cross') {
       const r = a.rect;
@@ -711,7 +669,37 @@ INDEX_HTML = r"""
     const nx0=Math.min(x0,x1), ny0=Math.min(y0,y1), nx1=Math.max(x0,x1), ny1=Math.max(y0,y1);
     a.rect=[nx0,ny0,nx1,ny1]; enforceMinRect(a);
   }
-  function deleteSelected(){ if (!state.sel) return; state.stack.splice(state.sel.index,1); state.sel=null; snapshot(); redrawOverlay(); }
+
+  function clearSelection(){ state.sel=null; selToolbar.style.display='none'; redrawOverlay(); }
+
+  function deleteSelected(){
+    if (!state.sel) return;
+    state.stack.splice(state.sel.index,1); state.sel=null; snapshot(); redrawOverlay();
+  }
+
+  // mini-toolbar actions
+  btnDel.addEventListener('click', (e)=>{ e.stopPropagation(); deleteSelected(); });
+  btnDup.addEventListener('click', (e)=>{
+    e.stopPropagation();
+    if (!state.sel) return;
+    const a = JSON.parse(JSON.stringify(state.stack[state.sel.index]));
+    if (a.rect) a.rect = [a.rect[0]+8, a.rect[1]+8, a.rect[2]+8, a.rect[3]+8];
+    if (a.points) a.points = a.points.map(p=>[p[0]+8,p[1]+8]);
+    state.stack.push(a); snapshot(); state.sel={index:state.stack.length-1,page:currentPage,handle:'move'}; redrawOverlay();
+  });
+
+  function updateSelToolbar(){
+    if (!state.sel || state.sel.page !== currentPage) { selToolbar.style.display='none'; return; }
+    const a = state.stack[state.sel.index]; if (!a) { selToolbar.style.display='none'; return; }
+    const r = a.rect ? a.rect : [ Math.min(a.points[0][0], a.points[1][0]), Math.min(a.points[0][1], a.points[1][1]),
+                                  Math.max(a.points[0][0], a.points[1][0]), Math.max(a.points[0][1], a.points[1][1]) ];
+    // place top-left of rect, slightly above
+    const left = Math.max(0, Math.min(overlay.width - selToolbar.offsetWidth, r[0]));
+    const top  = Math.max(0, r[1] - 36);
+    selToolbar.style.left = left + 'px';
+    selToolbar.style.top  = top + 'px';
+    selToolbar.style.display = 'block';
+  }
 
   // Build new action on drag
   function buildActionFromDrag(p1, p2, preview) {
@@ -759,70 +747,10 @@ INDEX_HTML = r"""
 
   function syncOverlaySize(){ overlay.width=Math.max(pageImg.clientWidth||1,1); overlay.height=Math.max(pageImg.clientHeight||1,1); overlay.style.width=overlay.width+'px'; overlay.style.height=overlay.height+'px'; }
   window.addEventListener('resize',syncOverlaySize);
+
 })();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-"""
-
-# Help page
-HELP_HTML = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mini PDF Editor — How to use</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
-  <style> body{background:#0b1020;color:#e7ecff} .card{background:#0f1428;border-color:#2a355d} .cap{color:#aeb7d6} </style>
-</head>
-<body class="p-4">
-  <div class="container">
-    <h2 class="mb-3">How to use the Mini PDF Editor</h2>
-    <ol class="mb-4">
-      <li class="mb-3"><strong>Upload</strong> a PDF with the file picker.</li>
-      <li class="mb-3">Use the <strong>thumbnails</strong> to change page. Adjust <strong>Zoom</strong> if needed.</li>
-      <li class="mb-3">Pick a <strong>tool</strong> and drag on the page (Highlight, Strikeout, Rect, Circle, Line, Arrow, Ink, Text, Signature, Tick, Cross).</li>
-      <li class="mb-3"><strong>Select & edit</strong>: click an item; drag to move; drag corners to resize; double-click text to edit; <kbd>Delete</kbd> to remove.</li>
-      <li class="mb-3">Click <strong>Save Edits</strong>, then <strong>Download</strong>.</li>
-      <li>If needed, use <strong>Rollback (server)</strong> to revert to the previous saved version.</li>
-    </ol>
-    <a href="/" class="btn btn-outline-light">Back to editor</a>
-  </div>
-</body>
-</html>
-"""
-
-# Shortcuts page
-SHORTCUTS_HTML = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mini PDF Editor — Shortcuts</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
-  <style> body{background:#0b1020;color:#e7ecff} .card{background:#0f1428;border-color:#2a355d} .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#11162a;border:1px solid #2a355d;border-radius:6px;padding:1px 6px} </style>
-</head>
-<body class="p-4">
-  <div class="container">
-    <h2 class="mb-3">Keyboard shortcuts</h2>
-    <div class="card p-3">
-      <table class="table table-dark table-sm align-middle mb-0">
-        <thead><tr><th>Action</th><th>Shortcut</th></tr></thead>
-        <tbody>
-          <tr><td>Select Highlight / Strikeout / Rect / Circle / Line / Arrow / Ink / Text / Signature</td>
-              <td>H / S / R / C / L / A / I / T / G</td></tr>
-          <tr><td>Undo</td><td>Ctrl/⌘ + Z</td></tr>
-          <tr><td>Redo</td><td>Ctrl/⌘ + Y</td></tr>
-          <tr><td>Delete selected</td><td>Delete / Backspace</td></tr>
-          <tr><td>Clear selection</td><td>Esc</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <a href="/" class="btn btn-outline-light mt-3">Back to editor</a>
-  </div>
 </body>
 </html>
 """
@@ -832,8 +760,12 @@ SHORTCUTS_HTML = r"""
 def index():
     return render_template_string(INDEX_HTML)
 
+HELP_HTML = r"""<!doctype html><title>Mini PDF Editor — Help</title><body style="background:#0b1020;color:#e7ecff;font-family:system-ui,Segoe UI,Arial;padding:24px"><h2>How to use</h2><ol><li>Upload a PDF.</li><li>Choose a tool then drag on the page.</li><li>Click an item to select. Use the small <b>Delete / Duplicate</b> toolbar by the selection, or press <b>Delete</b>.</li><li>Undo/Redo at any time. Save to write into the PDF. Download.</li><li>Server rollback restores the previous saved version.</li></ol><p><a href="/" style="color:#9cf">Back to editor</a></p></body>"""
+
+SHORTCUTS_HTML = r"""<!doctype html><title>Shortcuts</title><body style="background:#0b1020;color:#e7ecff;font-family:system-ui,Segoe UI,Arial;padding:24px"><h2>Keyboard shortcuts</h2><ul><li>H/S/R/C/L/A/I/T/G — select tool</li><li>Ctrl/⌘+Z Undo, Ctrl/⌘+Y Redo</li><li>Delete/Backspace — delete selected</li><li>Esc — clear selection</li></ul><p><a href="/" style="color:#9cf">Back to editor</a></p></body>"""
+
 @app.get("/help")
-def how_to():
+def help_page():
     return render_template_string(HELP_HTML)
 
 @app.get("/shortcuts")
@@ -976,26 +908,18 @@ def annotate(doc_id):
                 font = a.get("font", "helv")
                 size = float(a.get("font_size", 14))
 
-                # Ensure visible height for chosen size
                 min_text_height = max(16.0, size * 1.6)
                 if rect.height < min_text_height:
                     rect = fitz.Rect(rect.x0, rect.y0, rect.x1, min(page_rect.y1, rect.y0 + min_text_height))
 
                 annot = page.add_freetext_annot(rect, content)
-
-                # Set *text* color (not stroke/fill)
                 text_rgb = _color_tuple(a.get("color", [0, 0, 0]))
                 annot.set_colors(text=text_rgb)
-
-                # Optional: no border
                 annot.set_border(width=0)
-
-                # Font & size
                 try:
                     annot.set_font(font, size)
                 except Exception:
                     pass
-
                 annot.update()
 
             elif t == "signature":
@@ -1058,5 +982,5 @@ def health():
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+  port = int(os.environ.get("PORT", "8000"))
+  app.run(host="0.0.0.0", port=port, debug=False)

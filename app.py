@@ -1,18 +1,19 @@
 # app.py — Mini PDF Editor (Flask + PyMuPDF)
-# Fixes for "rect is infinite or empty":
-#  • Client: ignore tiny drags; signature gets a default size if too small
-#  • Server: clamp rects to page, enforce minimum width/height, fix zero-length lines
-#  • Always return JSON (no HTML error pages)
+# New: Select/Move/Resize/Edit for annotations (signature, textbox, shapes, highlight/strike, line/arrow)
+# - Click any existing annotation to select
+# - Drag inside to move, drag handles to resize (line/arrow: drag endpoints)
+# - Double-click selected textbox to edit text
+# - Delete key removes selected item
+# - Undo/Redo now snapshot the whole stack (supports edits as well as creates)
 #
-# Features: upload, thumbnails, zoom, highlight/strikeout (with fallbacks),
-# shapes, line/arrow, ink, textbox, signature (draw & place), undo/redo, rollback.
+# Prior fixes kept: JSON errors, safe fallbacks, size clamps, signature UX, zoom, thumbnails, rollback.
 #
-# requirements.txt:
+# requirements.txt (add gunicorn for Render/Heroku):
 # Flask==3.0.3
 # python-dotenv==1.0.1
 # PyMuPDF==1.24.6
-# gunicorn==22.0.0         # for Render/Heroku
-# boto3==1.34.162          # only if USE_S3=true
+# gunicorn==22.0.0
+# boto3==1.34.162  # only if USE_S3=true
 
 import io, os, uuid, base64, traceback
 from datetime import datetime
@@ -101,14 +102,12 @@ def _clip_rect(r: fitz.Rect, page_rect: fitz.Rect) -> fitz.Rect:
     return fitz.Rect(x0, y0, x1, y1)
 
 def _ensure_min_rect(r: fitz.Rect, page_rect: fitz.Rect, min_w=2.0, min_h=2.0) -> fitz.Rect:
-    # Expand around center if too small, then clip to page
     cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
     if r.width < min_w:
         r.x0, r.x1 = cx - min_w / 2, cx + min_w / 2
     if r.height < min_h:
         r.y0, r.y1 = cy - min_h / 2, cy + min_h / 2
     r = _clip_rect(r, page_rect)
-    # Guard against accidental inversion after clip
     if r.width <= 0 or r.height <= 0:
         r = fitz.Rect(cx - min_w / 2, cy - min_h / 2, cx + min_w / 2, cy + min_h / 2)
         r = _clip_rect(r, page_rect)
@@ -167,6 +166,7 @@ INDEX_HTML = r"""
         <span class="kbd">I</span> Ink,
         <span class="kbd">T</span> Text,
         <span class="kbd">G</span> Signature
+        — Click annotations to move/resize. ⌫/Del = delete. Double-click a textbox to edit.
       </div>
     </div>
 
@@ -233,9 +233,13 @@ INDEX_HTML = r"""
 
   const state = {
     tool: null, color: '#ffeb3b', thickness: 2,
-    stack: [], redo: [],
+    stack: [],                             // pending actions (all pages)
+    history: [], historyIdx: -1,           // snapshots for undo/redo
     drawing: false, stroke: [],
     signatureDataURL: null,
+
+    sel: null,         // {index, page, kind, handle, startMouse, startRect, startPoints}
+    draggingSel: false
   };
 
   const el = (id) => document.getElementById(id);
@@ -243,12 +247,17 @@ INDEX_HTML = r"""
   const pageImg = el('pageImg');
   const overlay = el('overlay');
 
-  // Tool buttons (Signature acts as a tool)
+  const MIN_PIX = 3;             // tiny drags ignored
+  const HANDLE = 8;              // handle size (px)
+  const HIT_PAD = 6;             // hit padding (px)
+
+  // Tool buttons
   toolbarBtns.forEach((b) => {
     b.addEventListener('click', () => {
       toolbarBtns.forEach((x) => x.classList.remove('tool-active'));
       b.classList.add('tool-active');
       state.tool = b.getAttribute('data-tool');
+      // Leaving selection active is fine; user can still move things
     });
   });
 
@@ -256,10 +265,14 @@ INDEX_HTML = r"""
   window.addEventListener('keydown', (e) => {
     const k = e.key.toLowerCase();
     const map = { h:'highlight', s:'strikeout', r:'rect', c:'circle', l:'line', a:'arrow', i:'ink', t:'textbox', g:'signature' };
-    const btn = document.querySelector(`[data-tool="${map[k]}"]`);
-    if (btn) btn.click();
-    if ((e.ctrlKey||e.metaKey) && k==='z') el('btnUndo').click();
-    if ((e.ctrlKey||e.metaKey) && k==='y') el('btnRedo').click();
+    if (!e.ctrlKey && !e.metaKey) {
+      const btn = document.querySelector(`[data-tool="${map[k]}"]`);
+      if (btn) btn.click();
+    }
+    if ((e.ctrlKey||e.metaKey) && k==='z') { undo(); }
+    if ((e.ctrlKey||e.metaKey) && k==='y') { redo(); }
+    if ((k === 'delete' || k === 'backspace') && state.sel) { deleteSelected(); e.preventDefault(); }
+    if (k === 'escape') { state.sel = null; redrawOverlay(); }
   });
 
   el('color').addEventListener('input', e => state.color = e.target.value);
@@ -276,10 +289,19 @@ INDEX_HTML = r"""
       const j = await parseMaybeJSON(r);
       if (!r.ok || j.error) throw new Error(j.error || 'Upload failed');
       docId = j.doc_id;
+      resetStacks();
       await loadThumbs();
       await renderPage(0);
     } catch (err) { alert('Upload error: ' + err.message); console.error(err); }
   });
+
+  function resetStacks(){
+    state.stack = [];
+    state.history = [];
+    state.historyIdx = -1;
+    snapshot(); // initial empty
+    state.sel = null;
+  }
 
   // Download / Rollback
   el('btnDownload').addEventListener('click', () => { if (docId) window.location.href = '/download/' + docId; });
@@ -289,14 +311,36 @@ INDEX_HTML = r"""
       const r = await fetch('/revert/' + docId, { method: 'POST' });
       const j = await parseMaybeJSON(r);
       if (!j.ok) throw new Error(j.error || 'Rollback failed');
-      state.stack = []; state.redo = [];
+      resetStacks();
       await renderPage();
     } catch (err) { alert('Rollback error: ' + err.message); console.error(err); }
   });
 
-  // Local undo/redo
-  el('btnUndo').addEventListener('click', () => { if (state.stack.length) { state.redo.push(state.stack.pop()); redrawOverlay(); } });
-  el('btnRedo').addEventListener('click', () => { if (state.redo.length) { state.stack.push(state.redo.pop()); redrawOverlay(); } });
+  // Undo/Redo via snapshots
+  el('btnUndo').addEventListener('click', () => undo());
+  el('btnRedo').addEventListener('click', () => redo());
+  function snapshot() {
+    // store a deep copy of stack
+    state.history = state.history.slice(0, state.historyIdx + 1);
+    state.history.push(JSON.stringify(state.stack));
+    state.historyIdx = state.history.length - 1;
+  }
+  function undo() {
+    if (state.historyIdx > 0) {
+      state.historyIdx--;
+      state.stack = JSON.parse(state.history[state.historyIdx]);
+      state.sel = null;
+      redrawOverlay();
+    }
+  }
+  function redo() {
+    if (state.historyIdx < state.history.length - 1) {
+      state.historyIdx++;
+      state.stack = JSON.parse(state.history[state.historyIdx]);
+      state.sel = null;
+      redrawOverlay();
+    }
+  }
 
   // Save
   el('btnSave').addEventListener('click', async () => {
@@ -309,7 +353,7 @@ INDEX_HTML = r"""
       });
       const j = await parseMaybeJSON(r);
       if (!j.ok) throw new Error(j.error || 'Save failed');
-      state.stack = []; state.redo = [];
+      resetStacks();
       await renderPage();
     } catch (err) { alert('Save error: ' + err.message); console.error(err); }
   });
@@ -344,7 +388,7 @@ INDEX_HTML = r"""
     overlay.style.width  = overlay.width  + 'px';
     overlay.style.height = overlay.height + 'px';
   }
-  window.addEventListener('resize', syncOverlaySize);
+  window.addEventListener('resize', () => { syncOverlaySize(); redrawOverlay(); });
 
   async function renderPage(p = currentPage) {
     if (docId == null) return;
@@ -355,22 +399,114 @@ INDEX_HTML = r"""
   }
 
   function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [(n>>16)&255, (n>>8)&255, n&255]; }
-  const MIN_PIX = 3; // ignore tiny drags
+
+  // ── Drawing + Selection/Editing ────────────────────────────────
+  overlay.addEventListener('mousedown', (e) => {
+    const pt = rel(e);
+
+    // First, try select/hit existing item
+    const hit = hitTestAt(pt.x, pt.y);
+    if (hit) {
+      state.sel = hit; state.draggingSel = true; state.sel.startMouse = [pt.x, pt.y];
+      snapshotStartForSel(); // prepare snapshot of current stack
+      return;
+    }
+
+    // Otherwise, start creating with the active tool
+    if (!state.tool) return;
+    state.drawing = true; state.start = [pt.x, pt.y];
+    if (state.tool === 'ink') state.stroke = [[pt.x, pt.y]];
+  });
+
+  overlay.addEventListener('mousemove', (e) => {
+    const pt = rel(e);
+
+    // Handle dragging selection (move / resize / line endpoints)
+    if (state.draggingSel && state.sel) {
+      applyDragToSelection(pt);
+      redrawOverlay();
+      return;
+    }
+
+    if (!state.drawing) {
+      redrawOverlay(); // ensures cursor/handles refresh
+      return;
+    }
+
+    if (state.tool === 'ink') { state.stroke.push([pt.x, pt.y]); redrawOverlay(); return; }
+
+    // Show preview while creating
+    redrawOverlay();
+    const ctx = overlay.getContext('2d');
+    const preview = buildActionFromDrag(state.start, [pt.x, pt.y], true);
+    if (preview) drawLocal(ctx, preview, true);
+  });
+
+  overlay.addEventListener('mouseup', (e) => {
+    const pt = rel(e);
+
+    // Finish dragging an existing selection
+    if (state.draggingSel && state.sel) {
+      state.draggingSel = false;
+      snapshot(); // commit new state
+      return;
+    }
+
+    if (!state.drawing) return;
+    state.drawing = false;
+
+    if (state.tool === 'ink') {
+      if (state.stroke.length > 1) {
+        state.stack.push({ type:'ink', page: currentPage, points:[state.stroke], color:hexToRgb(state.color), colorHex:state.color, thickness:state.thickness });
+        snapshot();
+      }
+      state.stroke = []; redrawOverlay(); return;
+    }
+
+    const act = buildActionFromDrag(state.start, [pt.x, pt.y], false);
+    if (!act) return;
+    state.stack.push(act); snapshot(); redrawOverlay();
+  });
+
+  // double-click to edit textbox text if selected
+  overlay.addEventListener('dblclick', () => {
+    const s = state.sel; if (!s) return;
+    const a = state.stack[s.index];
+    if (a && a.type === 'textbox' && a.page === currentPage) {
+      const newText = prompt('Edit text:', a.text || '');
+      if (newText !== null) { a.text = newText; snapshot(); redrawOverlay(); }
+    }
+  });
+
+  function rel(e) { const r = overlay.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
 
   function redrawOverlay() {
     const ctx = overlay.getContext('2d');
     ctx.clearRect(0,0,overlay.width, overlay.height);
-    for (const a of state.stack) if (a.page === currentPage) drawLocal(ctx, a);
+
+    // existing items
+    for (let i=0; i<state.stack.length; i++) {
+      const a = state.stack[i]; if (a.page !== currentPage) continue;
+      drawLocal(ctx, a, false);
+    }
+
+    // preview ink stroke
     if (state.drawing && state.tool === 'ink' && state.stroke.length) {
       ctx.lineWidth = state.thickness; ctx.strokeStyle = state.color;
       ctx.beginPath(); ctx.moveTo(state.stroke[0][0], state.stroke[0][1]);
       for (let i=1; i<state.stroke.length; i++) ctx.lineTo(state.stroke[i][0], state.stroke[i][1]);
       ctx.stroke();
     }
+
+    // selection overlay
+    if (state.sel && state.sel.page === currentPage) drawSelection(ctx, state.stack[state.sel.index], state.sel);
   }
 
-  function drawLocal(ctx, a) {
-    ctx.save(); ctx.strokeStyle = a.colorHex || '#000'; ctx.lineWidth = a.thickness || 2;
+  function drawLocal(ctx, a, isPreview=false) {
+    ctx.save();
+    ctx.strokeStyle = a.colorHex || '#000';
+    ctx.lineWidth = a.thickness || 2;
+
     if (a.type === 'highlight' || a.type === 'strikeout') {
       const r = a.rect; ctx.globalAlpha = a.opacity || (a.type==='highlight' ? 0.35 : 0.25);
       ctx.fillStyle = a.colorHex || '#ff0'; ctx.fillRect(r[0], r[1], r[2]-r[0], r[3]-r[1]); ctx.globalAlpha = 1.0;
@@ -380,7 +516,8 @@ INDEX_HTML = r"""
       const r = a.rect; const cx=(r[0]+r[2])/2, cy=(r[1]+r[3])/2; const rx=(r[2]-r[0])/2, ry=(r[3]-r[1])/2;
       ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.stroke();
     } else if (a.type === 'line' || a.type === 'arrow') {
-      const [p1,p2] = a.points; ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
+      const [p1,p2] = a.points;
+      ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
       if (a.type === 'arrow') {
         const ang = Math.atan2(p2[1]-p1[1], p2[0]-p1[0]), len = 10 + (a.thickness||2)*1.5;
         ctx.beginPath();
@@ -419,47 +556,142 @@ INDEX_HTML = r"""
     ctx.fillText(line, x, y);
   }
 
-  // Interactions
-  let start = null;
-  overlay.addEventListener('mousedown', (e) => {
-    if (!state.tool) return;
-    state.drawing = true; const {x,y} = rel(e); start = [x,y];
-    if (state.tool === 'ink') state.stroke = [[x,y]];
-  });
-  overlay.addEventListener('mousemove', (e) => {
-    if (!state.drawing) return;
-    const {x,y} = rel(e);
-    if (state.tool === 'ink') { state.stroke.push([x,y]); redrawOverlay(); return; }
-    redrawOverlay();
-    const ctx = overlay.getContext('2d');
-    const preview = previewAction(start, [x,y], true);
-    if (preview) drawLocal(ctx, preview);
-  });
-  overlay.addEventListener('mouseup', (e) => {
-    if (!state.drawing) return;
-    state.drawing = false; const {x,y} = rel(e);
-    if (state.tool === 'ink') {
-      if (state.stroke.length > 1) state.stack.push({ type:'ink', page: currentPage, points:[state.stroke], color:hexToRgb(state.color), colorHex:state.color, thickness:state.thickness });
-      state.redo = []; redrawOverlay(); state.stroke = []; return;
+  // ── Selection visuals & editing ────────────────────────────────
+  function drawSelection(ctx, a, sel) {
+    ctx.save();
+    ctx.setLineDash([6,4]); ctx.strokeStyle = '#6ea8fe'; ctx.lineWidth = 1.5;
+
+    if (a.type === 'line' || a.type === 'arrow') {
+      const [p1,p2] = a.points;
+      ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
+      drawHandle(ctx, p1[0], p1[1]); drawHandle(ctx, p2[0], p2[1]);
+    } else {
+      const r = a.rect;
+      ctx.strokeRect(r[0], r[1], r[2]-r[0], r[3]-r[1]);
+      const corners = rectHandles(r);
+      for (const c of corners) drawHandle(ctx, c[0], c[1]);
     }
-    const a = previewAction(start, [x,y], false);
-    if (!a) return;
-    state.stack.push(a); state.redo = []; redrawOverlay();
-  });
+    ctx.restore();
+  }
 
-  function rel(e) { const r = overlay.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
-  function dist(p1,p2){ const dx=p2[0]-p1[0], dy=p2[1]-p1[1]; return Math.hypot(dx,dy); }
+  function drawHandle(ctx, x, y) {
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#6ea8fe';
+    ctx.fillRect(x - HANDLE/2, y - HANDLE/2, HANDLE, HANDLE);
+    ctx.restore();
+  }
 
-  function previewAction(p1, p2, forPreview) {
+  function rectHandles(r) { // 4 corners
+    const x0=r[0], y0=r[1], x1=r[2], y1=r[3];
+    return [[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+  }
+
+  function hitTestAt(x, y) {
+    // highest on top (last in stack)
+    for (let i=state.stack.length-1; i>=0; i--) {
+      const a = state.stack[i];
+      if (a.page !== currentPage) continue;
+
+      if (a.type === 'line' || a.type === 'arrow') {
+        const [p1,p2] = a.points;
+        if (distPt(p1,[x,y]) <= HANDLE) return selObj(i,'p1');
+        if (distPt(p2,[x,y]) <= HANDLE) return selObj(i,'p2');
+        if (pointToSegment([x,y], p1, p2) <= HIT_PAD) return selObj(i,'move');
+      } else {
+        const r = a.rect, hx = rectHandles(r);
+        for (let h=0; h<hx.length; h++) {
+          if (Math.abs(x - hx[h][0]) <= HANDLE && Math.abs(y - hx[h][1]) <= HANDLE)
+            return selObj(i, ['nw','ne','se','sw'][h]);
+        }
+        if (x >= r[0]-HIT_PAD && x <= r[2]+HIT_PAD && y >= r[1]-HIT_PAD && y <= r[3]+HIT_PAD)
+          return selObj(i,'move');
+      }
+    }
+    return null;
+  }
+
+  function selObj(index, handle) { return { index, page: currentPage, handle }; }
+
+  function distPt(a,b){ const dx=a[0]-b[0], dy=a[1]-b[1]; return Math.hypot(dx,dy); }
+  function pointToSegment(p, a, b){ // distance of p to segment ab
+    const vx=b[0]-a[0], vy=b[1]-a[1]; const wx=p[0]-a[0], wy=p[1]-a[1];
+    const c1 = vx*wx + vy*wy; if (c1 <= 0) return distPt(p,a);
+    const c2 = vx*vx + vy*vy; if (c2 <= c1) return distPt(p,b);
+    const t = c1 / c2; const proj=[a[0]+t*vx, a[1]+t*vy]; return distPt(p, proj);
+  }
+
+  let snapshotBeforeSel = null;
+  function snapshotStartForSel() {
+    snapshotBeforeSel = JSON.stringify(state.stack);
+  }
+
+  function applyDragToSelection(pt) {
+    const s = state.sel; if (!s) return;
+    const a = state.stack[s.index];
+    const dx = pt.x - s.startMouse[0], dy = pt.y - s.startMouse[1];
+
+    if (a.type === 'line' || a.type === 'arrow') {
+      if (!s.startPoints) s.startPoints = JSON.parse(JSON.stringify(a.points));
+      if (s.handle === 'p1') {
+        a.points[0] = [ clampX(s.startPoints[0][0] + dx), clampY(s.startPoints[0][1] + dy) ];
+      } else if (s.handle === 'p2') {
+        a.points[1] = [ clampX(s.startPoints[1][0] + dx), clampY(s.startPoints[1][1] + dy) ];
+      } else { // move both
+        a.points[0] = [ clampX(s.startPoints[0][0] + dx), clampY(s.startPoints[0][1] + dy) ];
+        a.points[1] = [ clampX(s.startPoints[1][0] + dx), clampY(s.startPoints[1][1] + dy) ];
+      }
+      return;
+    }
+
+    // rect-like
+    if (!s.startRect) s.startRect = [...a.rect];
+    let [x0,y0,x1,y1] = s.startRect;
+
+    if (s.handle === 'move') {
+      x0 = clampX(x0 + dx); x1 = clampX(x1 + dx);
+      y0 = clampY(y0 + dy); y1 = clampY(y1 + dy);
+      a.rect = [x0,y0,x1,y1]; enforceMinRect(a);
+      return;
+    }
+
+    // resize by corner
+    if (s.handle === 'nw') { x0 = clampX(x0 + dx); y0 = clampY(y0 + dy); }
+    if (s.handle === 'ne') { x1 = clampX(x1 + dx); y0 = clampY(y0 + dy); }
+    if (s.handle === 'se') { x1 = clampX(x1 + dx); y1 = clampY(y1 + dy); }
+    if (s.handle === 'sw') { x0 = clampX(x0 + dx); y1 = clampY(y1 + dy); }
+    // normalize
+    const nx0 = Math.min(x0,x1), ny0 = Math.min(y0,y1), nx1 = Math.max(x0,x1), ny1 = Math.max(y0,y1);
+    a.rect = [nx0,ny0,nx1,ny1]; enforceMinRect(a);
+  }
+
+  function clampX(v){ return Math.max(0, Math.min(overlay.width, v)); }
+  function clampY(v){ return Math.max(0, Math.min(overlay.height, v)); }
+  function enforceMinRect(a){
+    const r=a.rect, w=r[2]-r[0], h=r[3]-r[1];
+    if (w < MIN_PIX) { const c=(r[0]+r[2])/2; a.rect=[c-MIN_PIX/2, r[1], c+MIN_PIX/2, r[3]]; }
+    if (h < MIN_PIX) { const c=(r[1]+r[3])/2; a.rect=[r[0], c-MIN_PIX/2, r[2], c+MIN_PIX/2]; }
+  }
+
+  function deleteSelected(){
+    if (!state.sel) return;
+    state.stack.splice(state.sel.index, 1);
+    state.sel = null;
+    snapshot();
+    redrawOverlay();
+  }
+
+  // Build action from a creation drag
+  function buildActionFromDrag(p1, p2, forPreview) {
     const color = hexToRgb(state.color);
     const base = { page: currentPage, color, colorHex: state.color, thickness: state.thickness };
     const rect = [Math.min(p1[0],p2[0]), Math.min(p1[1],p2[1]), Math.max(p1[0],p2[0]), Math.max(p1[1],p2[1])];
     const w = rect[2]-rect[0], h = rect[3]-rect[1];
 
     if (state.tool === 'signature') {
-      // If the drag is tiny, give a sensible default size to avoid zero rect
       let rx=rect[0], ry=rect[1], rw=w, rh=h;
       if (rw < MIN_PIX || rh < MIN_PIX) { rw = 180; rh = 60; }
+      if (!state.signatureDataURL) { if(!forPreview) alert('Open Signature and draw your signature first.'); return null; }
       return { ...base, type:'signature', rect:[rx, ry, rx+rw, ry+rh], previewDataURL: state.signatureDataURL, image_data_url: state.signatureDataURL };
     }
 
@@ -473,8 +705,11 @@ INDEX_HTML = r"""
     if (state.tool === 'strikeout') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'strikeout', rect, opacity:0.25 };
     if (state.tool === 'rect') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'shape_rect', rect };
     if (state.tool === 'circle') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'shape_circle', rect };
-    if (state.tool === 'line' || state.tool === 'arrow') return (dist(p1,p2) < MIN_PIX) ? null : { ...base, type: state.tool, points: [p1, p2] };
 
+    if (state.tool === 'line' || state.tool === 'arrow') {
+      const d = Math.hypot(p2[0]-p1[0], p2[1]-p1[1]);
+      return (d < MIN_PIX) ? null : { ...base, type: state.tool, points: [p1, p2] };
+    }
     return null;
   }
 
@@ -493,8 +728,6 @@ INDEX_HTML = r"""
 
   function syncOverlaySize(){ overlay.width=Math.max(pageImg.clientWidth||1,1); overlay.height=Math.max(pageImg.clientHeight||1,1); overlay.style.width=overlay.width+'px'; overlay.style.height=overlay.height+'px'; }
   window.addEventListener('resize',syncOverlaySize);
-  async function renderPage(p=currentPage){ if(docId==null) return; currentPage=p; pageImg.src=`/page/${docId}/${currentPage}?zoom=${zoom}`; await new Promise((res,rej)=>{ pageImg.onload=res; pageImg.onerror=()=>rej(new Error('Failed to load page image'));}); syncOverlaySize(); redrawOverlay(); }
-
 })();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -579,7 +812,6 @@ def annotate(doc_id):
                     if "opacity" in a: annot.set_opacity(float(a["opacity"]))
                     annot.update()
                 except Exception:
-                    # fallback: translucent rect highlight
                     annot = page.add_rect_annot(rect)
                     annot.set_colors(stroke=None, fill=_color_tuple(a.get("color")))
                     annot.set_opacity(float(a.get("opacity", 0.35)))
@@ -592,10 +824,8 @@ def annotate(doc_id):
                     if "opacity" in a: annot.set_opacity(float(a["opacity"]))
                     annot.update()
                 except Exception:
-                    # fallback: center line across the rect
                     y = (rect.y0 + rect.y1) / 2
-                    p1 = fitz.Point(rect.x0, y)
-                    p2 = fitz.Point(rect.x1, y)
+                    p1 = fitz.Point(rect.x0, y); p2 = fitz.Point(rect.x1, y)
                     annot = page.add_line_annot(p1, p2)
                     annot.set_border(width=float(a.get("thickness", 2)))
                     annot.set_colors(stroke=_color_tuple(a.get("color")))
@@ -617,7 +847,6 @@ def annotate(doc_id):
                 p1 = _scale_point(a["points"][0], page_rect, viewport)
                 p2 = _scale_point(a["points"][1], page_rect, viewport)
                 if p1 == p2:
-                    # expand to a tiny diagonal to avoid zero-length
                     p2 = fitz.Point(min(page_rect.x1, p2.x + 5), min(page_rect.y1, p2.y + 5))
                 annot = page.add_line_annot(p1, p2)
                 annot.set_border(width=float(a.get("thickness", 2)))
@@ -629,7 +858,6 @@ def annotate(doc_id):
 
             elif t == "ink":
                 strokes = [[_scale_point(pt, page_rect, viewport) for pt in stroke] for stroke in a["points"]]
-                # Skip empty / single-point strokes
                 strokes = [s for s in strokes if len(s) > 1]
                 if not strokes: continue
                 annot = page.add_ink_annot(strokes)

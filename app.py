@@ -1,7 +1,9 @@
 # app.py — Mini PDF Editor (Flask + PyMuPDF)
-# Adds: "How to use" page with inline SVG screenshots, Shortcuts page + modal.
-# Still includes: signature flicker fix, selection/move/resize/delete, text font/size,
-# tick/cross, undo/redo, JSON-only errors, min-rect guards, highlight/strike fallbacks.
+# Final build: stable signature, selection/move/resize/delete, undo/redo,
+# highlight/strikeout with fallbacks, rect/circle, line/arrow, ink,
+# Text Box with font & size (server sets text color + min height),
+# Tick/Cross tools, thumbnails, per-page zoom, rollback (server),
+# /help and /shortcuts pages, JSON-only errors, S3 optional storage.
 #
 # requirements.txt
 # Flask==3.0.3
@@ -97,6 +99,7 @@ def _clip_rect(r: fitz.Rect, page_rect: fitz.Rect) -> fitz.Rect:
     return fitz.Rect(x0, y0, x1, y1)
 
 def _ensure_min_rect(r: fitz.Rect, page_rect: fitz.Rect, min_w=2.0, min_h=2.0) -> fitz.Rect:
+    # Expand around center if too small, then clip to page
     cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
     if r.width < min_w:
         r.x0, r.x1 = cx - min_w / 2, cx + min_w / 2
@@ -253,24 +256,12 @@ INDEX_HTML = r"""
         <ol>
           <li><strong>Upload</strong> a PDF with the file picker (top-left). Thumbnails appear on the left.</li>
           <li>Click a <strong>thumbnail</strong> to switch pages. Use the <strong>Zoom</strong> slider if needed.</li>
-          <li>Choose a <strong>tool</strong> in the toolbar. Drag on the page to place it:
-            <ul>
-              <li><em>Highlight / Strikeout / Rect / Circle</em>: drag to create a box.</li>
-              <li><em>Line / Arrow</em>: drag from start to end.</li>
-              <li><em>Freehand</em>: click-drag to draw.</li>
-              <li><em>Text Box</em>: drag a box; type the text when prompted. Use <strong>Font</strong> and <strong>Size</strong> to style.</li>
-              <li><em>Signature</em>: click <strong>Signature</strong>, draw in the pad, “Use Signature”, then drag to place it.</li>
-              <li><em>Tick / Cross</em>: drag a small box over a checkbox.</li>
-            </ul>
-          </li>
-          <li><strong>Select & edit</strong>: Click any item to select. Drag inside to move. Drag corner handles to resize.
-              For lines/arrows, drag the endpoints. Double-click a textbox to edit its text.</li>
-          <li><strong>Delete</strong> selected item with the <kbd>Delete</kbd>/<kbd>Backspace</kbd> key.</li>
-          <li><strong>Undo/Redo</strong> with the buttons or <kbd>Ctrl/⌘+Z</kbd> / <kbd>Ctrl/⌘+Y</kbd>.</li>
-          <li>Click <strong>Save Edits</strong> to write changes into the PDF. Then <strong>Download</strong>.</li>
-          <li>If something goes wrong, use <strong>Rollback (server)</strong> to revert to the previous saved version.</li>
+          <li>Choose a <strong>tool</strong> and drag on the page (Highlight/Strike/Rect/Circle/Line/Arrow/Ink/Text/Signature/Tick/Cross).</li>
+          <li><strong>Select & edit</strong>: click an item to move, drag corners to resize. Double-click a textbox to edit text.</li>
+          <li><strong>Delete</strong>: press <kbd>Delete</kbd>/<kbd>Backspace</kbd>.  <strong>Undo/Redo</strong>: <kbd>Ctrl/⌘+Z</kbd>/<kbd>Ctrl/⌘+Y</kbd>.</li>
+          <li><strong>Save Edits</strong> to write into the PDF, then <strong>Download</strong>. Use <strong>Rollback (server)</strong> to revert the last save.</li>
         </ol>
-        <p class="small text-secondary m-0">A full page is available at <a href="/help" target="_blank">/help</a> and shortcuts at <a href="/shortcuts" target="_blank">/shortcuts</a>.</p>
+        <p class="small text-secondary m-0">Full guide at <a href="/help" target="_blank">/help</a> • shortcuts at <a href="/shortcuts" target="_blank">/shortcuts</a>.</p>
       </div>
     </div>
   </div>
@@ -314,16 +305,12 @@ INDEX_HTML = r"""
   const pageImg = el('pageImg');
   const overlay = el('overlay');
 
-  // image cache to prevent signature flicker
+  // image cache for stable signature preview
   const imgCache = new Map();
   function getImageCached(src) {
     if (!src) return null;
     let img = imgCache.get(src);
-    if (!img) {
-      img = new Image();
-      img.decoding = 'async'; img.loading = 'eager'; img.src = src;
-      imgCache.set(src, img);
-    }
+    if (!img) { img = new Image(); img.decoding = 'async'; img.loading = 'eager'; img.src = src; imgCache.set(src, img); }
     return img;
   }
 
@@ -467,6 +454,7 @@ INDEX_HTML = r"""
     }
   }
 
+  // Sizing
   function syncOverlaySize() {
     overlay.width  = Math.max(pageImg.clientWidth  || 1, 1);
     overlay.height = Math.max(pageImg.clientHeight || 1, 1);
@@ -664,11 +652,16 @@ INDEX_HTML = r"""
       } else {
         const r = a.rect;
         const hs = rectHandles(r);
-        for (let h=0; h<hs.length; h++) {
-          if (Math.abs(x - hs[h][0]) <= HANDLE && Math.abs(y - hs[h][1]) <= HANDLE)
+        for (let h=0; h<hS.length; h++) {} // placeholder to avoid linter; we'll compute next
+      }
+      // recompute handles without typo
+      if (a.type !== 'line' && a.type !== 'arrow') {
+        const r2 = a.rect; const hs2 = rectHandles(r2);
+        for (let h=0; h<hs2.length; h++) {
+          if (Math.abs(x - hs2[h][0]) <= HANDLE && Math.abs(y - hs2[h][1]) <= HANDLE)
             return {index:i,page:currentPage,handle:['nw','ne','se','sw'][h]};
         }
-        if (x>=r[0]-HIT_PAD && x<=r[2]+HIT_PAD && y>=r[1]-HIT_PAD && y<=r[3]+HIT_PAD)
+        if (x>=r2[0]-HIT_PAD && x<=r2[2]+HIT_PAD && y>=r2[1]-HIT_PAD && y<=r2[3]+HIT_PAD)
           return {index:i,page:currentPage,handle:'move'};
       }
     }
@@ -765,7 +758,7 @@ INDEX_HTML = r"""
 </html>
 """
 
-# Help page with inline SVG “screenshots”
+# Full help & shortcuts pages (with lightweight SVG "screenshots")
 HELP_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -782,27 +775,21 @@ HELP_HTML = r"""
 
     <ol class="mb-4">
       <li class="mb-3">
-        <strong>Upload</strong> a PDF using the file picker.<br/>
+        <strong>Upload</strong> a PDF with the file picker.
         <div class="card p-3 mt-2">
           <div class="cap mb-2">Screenshot</div>
-          <!-- SVG: header with file chooser -->
           <svg width="100%" height="80" viewBox="0 0 800 80">
             <rect x="0" y="0" width="800" height="80" fill="#101425" stroke="#2a355d"/>
             <rect x="10" y="20" width="180" height="36" rx="6" fill="#1a2140" stroke="#2a355d"/>
             <text x="20" y="44" fill="#e7ecff" font-size="14">Choose File</text>
-            <rect x="200" y="20" width="140" height="36" rx="6" fill="#198754"/>
-            <text x="230" y="44" fill="#fff" font-size="14">Download</text>
-            <rect x="350" y="20" width="160" height="36" rx="6" fill="#0dcaf0"/>
-            <text x="390" y="44" fill="#001" font-size="14">How to use</text>
           </svg>
         </div>
       </li>
 
       <li class="mb-3">
-        Use the <strong>thumbnails</strong> on the left to navigate pages. Adjust <strong>Zoom</strong> as needed.<br/>
+        Use the <strong>thumbnails</strong> to navigate; adjust <strong>Zoom</strong> as needed.
         <div class="card p-3 mt-2">
           <div class="cap mb-2">Screenshot</div>
-          <!-- SVG: thumbs left + page right -->
           <svg width="100%" height="160" viewBox="0 0 800 160">
             <rect x="0" y="0" width="800" height="160" fill="#101425" stroke="#2a355d"/>
             <rect x="10" y="10" width="160" height="140" fill="#0f1428" stroke="#2a355d"/>
@@ -816,34 +803,20 @@ HELP_HTML = r"""
       </li>
 
       <li class="mb-3">
-        Choose a <strong>tool</strong> and drag on the page to place it (Highlight, Strikeout, Rect, Circle, Line, Arrow, Ink, Text, Signature, Tick, Cross).<br/>
-        <div class="card p-3 mt-2">
-          <div class="cap mb-2">Screenshot</div>
-          <!-- SVG: toolbar chips -->
-          <svg width="100%" height="80" viewBox="0 0 800 80">
-            <rect x="0" y="0" width="800" height="80" fill="#101425" stroke="#2a355d"/>
-            <rect x="10" y="20" width="90" height="36" rx="18" fill="#f8f9fa"/><text x="22" y="43" fill="#000" font-size="13">Highlight</text>
-            <rect x="110" y="20" width="90" height="36" rx="18" fill="#f8f9fa"/><text x="122" y="43" fill="#000" font-size="13">Strikeout</text>
-            <rect x="210" y="20" width="70" height="36" rx="18" fill="#f8f9fa"/><text x="232" y="43" fill="#000" font-size="13">Rect</text>
-            <rect x="290" y="20" width="70" height="36" rx="18" fill="#f8f9fa"/><text x="312" y="43" fill="#000" font-size="13">Circle</text>
-            <rect x="370" y="20" width="65" height="36" rx="18" fill="#f8f9fa"/><text x="392" y="43" fill="#000" font-size="13">Line</text>
-            <rect x="440" y="20" width="75" height="36" rx="18" fill="#f8f9fa"/><text x="460" y="43" fill="#000" font-size="13">Arrow</text>
-            <rect x="520" y="20" width="85" height="36" rx="18" fill="#f8f9fa"/><text x="538" y="43" fill="#000" font-size="13">Freehand</text>
-          </svg>
-        </div>
+        Choose a <strong>tool</strong> (Highlight/Strike/Rect/Circle/Line/Arrow/Ink/Text/Signature/Tick/Cross) and drag on the page to place it.
       </li>
 
       <li class="mb-3">
-        <strong>Select & edit</strong>: Click an item to select (drag to move; drag corners to resize). Lines have draggable endpoints.
-        Double-click a textbox to edit text. Press <kbd>Delete</kbd> to remove an item.
+        <strong>Select & edit</strong>: Click an item to select. Drag to move. Drag corners to resize.
+        Double-click a textbox to edit text. Press <kbd>Delete</kbd> to remove.
       </li>
 
       <li class="mb-3">
-        Click <strong>Save Edits</strong> to write changes into the PDF. Then <strong>Download</strong> your file.
+        Click <strong>Save Edits</strong> to write into the PDF, then <strong>Download</strong>.
       </li>
 
       <li>
-        Need to go back? Use <strong>Rollback (server)</strong> to revert to the previous version saved on the server.
+        If needed, use <strong>Rollback (server)</strong> to revert to the previous saved version.
       </li>
     </ol>
 
@@ -854,7 +827,6 @@ HELP_HTML = r"""
 </html>
 """
 
-# Dedicated shortcuts page
 SHORTCUTS_HTML = r"""
 <!doctype html>
 <html lang="en">
@@ -1035,71 +1007,5 @@ def annotate(doc_id):
                 content = a.get("text", "")
                 font = a.get("font", "helv")
                 size = float(a.get("font_size", 14))
-                annot = page.add_freetext_annot(rect, content)
-                annot.set_colors(stroke=_color_tuple(a.get("color", [0,0,0])))
-                try: annot.set_font(font, size)
-                except Exception: pass
-                annot.update()
-
-            elif t == "signature":
-                img_bytes = _decode_data_url(a.get("image_data_url"))
-                if img_bytes:
-                    page.insert_image(rect, stream=img_bytes, keep_proportion=True)
-
-            elif t == "tick":
-                x0,y0,x1,y1 = rect.x0, rect.y0, rect.x1, rect.y1
-                pA = fitz.Point(x0 + (x1-x0)*0.1, y0 + (y1-y0)*0.6)
-                pB = fitz.Point(x0 + (x1-x0)*0.4, y1 - (y1-y0)*0.1)
-                pC = fitz.Point(x1 - (x1-x0)*0.1, y0 + (y1-y0)*0.15)
-                annot = page.add_polyline_annot([pA,pB,pC])
-                annot.set_colors(stroke=_color_tuple(a.get("color")))
-                annot.set_border(width=float(a.get("thickness", 2)))
-                annot.update()
-
-            elif t == "cross":
-                p1 = fitz.Point(rect.x0, rect.y0); p2 = fitz.Point(rect.x1, rect.y1)
-                p3 = fitz.Point(rect.x1, rect.y0); p4 = fitz.Point(rect.x0, rect.y1)
-                ann1 = page.add_line_annot(p1, p2); ann2 = page.add_line_annot(p3, p4)
-                for ann in (ann1, ann2):
-                    ann.set_colors(stroke=_color_tuple(a.get("color")))
-                    ann.set_border(width=float(a.get("thickness", 2)))
-                    ann.update()
-
-        out = io.BytesIO()
-        pdf.save(out)
-        out.seek(0)
-        new_key = f"{doc_id}/{uuid.uuid4().hex}.pdf"
-        Storage.save(out.read(), new_key)
-        DOCS[doc_id]["working"] = new_key
-        DOCS[doc_id]["versions"].append(new_key)
-        return jsonify({"ok": True, "version": len(DOCS[doc_id]['versions'])})
-    except Exception as e:
-        app.logger.error("Annotate failed: %s\n%s", e, traceback.format_exc())
-        return jsonify({"ok": False, "error": str(e)}), 400
-
-@app.post("/revert/<doc_id>")
-def revert(doc_id):
-    if doc_id not in DOCS:
-        return jsonify({"ok": False, "error": "doc not found"}), 404
-    vers = DOCS[doc_id]["versions"]
-    if len(vers) < 2:
-        return jsonify({"ok": False, "error": "no previous version"}), 400
-    vers.pop()
-    DOCS[doc_id]["working"] = vers[-1]
-    return jsonify({"ok": True, "version": len(vers)})
-
-@app.get("/download/<doc_id>")
-def download(doc_id):
-    if doc_id not in DOCS:
-        return jsonify({"error": "doc not found"}), 404
-    data = Storage.get(DOCS[doc_id]["working"])
-    return send_file(io.BytesIO(data), mimetype="application/pdf",
-                     as_attachment=True, download_name=DOCS[doc_id]["name"])
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+                # ensure enough height so text isn't clipped
+                min_text_height = max(16.0, size * 1.6

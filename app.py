@@ -672,4 +672,290 @@ INDEX_HTML = r"""
 
   function updateSelToolbar(){
     if (!state.sel || state.sel.page !== currentPage) { selToolbar.style.display='none'; return; }
-    const a = state.sta
+    const a = state.stack[state.sel.index]; if (!a) { selToolbar.style.display='none'; return; }
+    const r = a.rect ? a.rect : [ Math.min(a.points[0][0], a.points[1][0]), Math.min(a.points[0][1], a.points[1][1]),
+                                  Math.max(a.points[0][0], a.points[1][0]), Math.max(a.points[0][1], a.points[1][1]) ];
+    const left = Math.max(0, Math.min(overlay.width - selToolbar.offsetWidth, r[0]));
+    const top  = Math.max(0, r[1] - 36);
+    selToolbar.style.left = left + 'px';
+    selToolbar.style.top  = top + 'px';
+    selToolbar.style.display = 'block';
+  }
+
+  function buildActionFromDrag(p1, p2, preview) {
+    const color = hexToRgb(state.color);
+    const base = { page: currentPage, color, colorHex: state.color, thickness: state.thickness };
+    const rect = [Math.min(p1[0],p2[0]), Math.min(p1[1],p2[1]), Math.max(p1[0],p2[0]), Math.max(p1[1],p2[1])];
+    const w = rect[2]-rect[0], h = rect[3]-rect[1];
+
+    if (state.tool === 'signature') {
+      let rw=w, rh=h; if (rw < MIN_PIX || rh < MIN_PIX) { rw=180; rh=60; }
+      if (!state.signatureDataURL) { if(!preview) alert('Open Signature and draw your signature first.'); return null; }
+      getImageCached(state.signatureDataURL);
+      return { ...base, type:'signature', rect:[rect[0],rect[1],rect[0]+rw,rect[1]+rh], previewDataURL: state.signatureDataURL, image_data_url: state.signatureDataURL };
+    }
+    if (state.tool === 'textbox') {
+      if (w < MIN_PIX || h < MIN_PIX) return null;
+      const text = preview ? '' : (prompt('Text content?') || '');
+      return { ...base, type:'textbox', rect, font_size: state.fontSize, font: state.fontFamily, text };
+    }
+    if (state.tool === 'highlight') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'highlight', rect, opacity:0.35 };
+    if (state.tool === 'strikeout') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'strikeout', rect, opacity:0.25 };
+    if (state.tool === 'rect') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'shape_rect', rect };
+    if (state.tool === 'circle') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'shape_circle', rect };
+    if (state.tool === 'tick') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'tick', rect };
+    if (state.tool === 'cross') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'cross', rect };
+    if (state.tool === 'line' || state.tool === 'arrow') {
+      if (Math.hypot(p2[0]-p1[0], p2[1]-p1[1]) < MIN_PIX) return null;
+      return { ...base, type: state.tool, points: [p1, p2] };
+    }
+    return null;
+  }
+
+  const sigPad = document.getElementById('sigPad'); const sigCtx = sigPad.getContext('2d');
+  sigCtx.lineWidth=2; sigCtx.lineCap='round'; sigCtx.strokeStyle='#111';
+  let sigDraw=false, last=null;
+  function sigPos(e){ const r=sigPad.getBoundingClientRect(); const t=e.touches?.[0]||e; return { x:t.clientX-r.left, y:t.clientY-r.top }; }
+  function sigStart(e){ sigDraw=true; last=sigPos(e); e.preventDefault(); }
+  function sigMove(e){ if(!sigDraw) return; const p=sigPos(e); sigCtx.beginPath(); sigCtx.moveTo(last.x,last.y); sigCtx.lineTo(p.x,p.y); sigCtx.stroke(); last=p; e.preventDefault(); }
+  function sigEnd(){ sigDraw=false; }
+  sigPad.addEventListener('mousedown',sigStart); sigPad.addEventListener('mousemove',sigMove); window.addEventListener('mouseup',sigEnd);
+  sigPad.addEventListener('touchstart',sigStart,{passive:false}); sigPad.addEventListener('touchmove',sigMove,{passive:false}); sigPad.addEventListener('touchend',sigEnd);
+  document.getElementById('sigClear').addEventListener('click',()=>{ sigCtx.clearRect(0,0,sigPad.width,sigPad.height); document.getElementById('sigStatus').textContent='Not set'; state.signatureDataURL=null; });
+  document.getElementById('sigUse').addEventListener('click',()=>{ state.signatureDataURL=sigPad.toDataURL('image/png'); getImageCached(state.signatureDataURL); document.getElementById('sigStatus').textContent='Signature saved'; state.tool='signature'; toolbarBtns.forEach(x=>x.classList.remove('tool-active')); document.querySelector('[data-tool="signature"]')?.classList.add('tool-active');});
+
+  function syncOverlaySize(){ overlay.width=Math.max(pageImg.clientWidth||1,1); overlay.height=Math.max(pageImg.clientHeight||1,1); overlay.style.width=overlay.width+'px'; overlay.style.height=overlay.height+'px'; }
+  window.addEventListener('resize',syncOverlaySize);
+
+})();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+# ───────── Routes ─────────
+@app.get("/")
+def index():
+    return render_template_string(INDEX_HTML)
+
+HELP_HTML = r"""<!doctype html><title>Mini PDF Editor — Help</title><body style="background:#0b1020;color:#e7ecff;font-family:system-ui,Segoe UI,Arial;padding:24px"><h2>How to use</h2><ol><li>Upload a PDF.</li><li>Choose a tool then drag on the page.</li><li>Click an item to select. Use the small <b>Delete / Duplicate</b> toolbar by the selection, or press <b>Delete</b>.</li><li>Undo/Redo at any time. Save to write into the PDF. Download.</li><li>Server rollback restores the previous saved version.</li></ol><p><a href="/" style="color:#9cf">Back to editor</a></p></body>"""
+
+SHORTCUTS_HTML = r"""<!doctype html><title>Shortcuts</title><body style="background:#0b1020;color:#e7ecff;font-family:system-ui,Segoe UI,Arial;padding:24px"><h2>Keyboard shortcuts</h2><ul><li>H/S/R/C/L/A/I/T/G — select tool</li><li>Ctrl/⌘+Z Undo, Ctrl/⌘+Y Redo</li><li>Delete/Backspace — delete selected</li><li>Esc — clear selection</li></ul><p><a href="/" style="color:#9cf">Back to editor</a></p></body>"""
+
+@app.get("/help")
+def help_page():
+    return render_template_string(HELP_HTML)
+
+@app.get("/shortcuts")
+def shortcuts_page():
+    return render_template_string(SHORTCUTS_HTML)
+
+@app.post("/upload")
+def upload():
+    f = request.files.get("file")
+    if not f or not _allowed(f.filename):
+        return jsonify({"error": "Please upload a PDF file"}), 400
+    filename = secure_filename(f.filename)
+    doc_id = str(uuid.uuid4())
+    original = f"{doc_id}/original.pdf"
+    Storage.save(f.read(), original)
+    working = f"{doc_id}/working.pdf"
+    Storage.save(Storage.get(original), working)
+    DOCS[doc_id] = {
+        "name": filename,
+        "original": original,
+        "working": working,
+        "versions": [working],
+        "created": datetime.utcnow().isoformat(),
+    }
+    return jsonify({"doc_id": doc_id})
+
+@app.get("/thumbs/<doc_id>")
+def thumbs(doc_id):
+    if doc_id not in DOCS:
+        return jsonify({"error": "doc not found"}), 404
+    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
+    return jsonify({"pages": len(pdf)})
+
+@app.get("/thumb/<doc_id>/<int:page>")
+def thumb(doc_id, page):
+    if doc_id not in DOCS:
+        return jsonify({"error": "doc not found"}), 404
+    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
+    if not (0 <= page < len(pdf)):
+        return jsonify({"error": "bad page"}), 400
+    pix = pdf[page].get_pixmap(dpi=120)
+    return send_file(io.BytesIO(pix.tobytes("png")), mimetype="image/png")
+
+@app.get("/page/<doc_id>/<int:page>")
+def page_png(doc_id, page):
+    if doc_id not in DOCS:
+        return jsonify({"error": "doc not found"}), 404
+    zoom = float(request.args.get("zoom", "1.0"))
+    dpi = max(72, min(300, int(144 * zoom)))
+    pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
+    if not (0 <= page < len(pdf)):
+        return jsonify({"error": "bad page"}), 400
+    mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    pix = pdf[page].get_pixmap(matrix=mat, alpha=False)
+    return send_file(io.BytesIO(pix.tobytes("png")), mimetype="image/png")
+
+@app.post("/annotate/<doc_id>")
+def annotate(doc_id):
+    try:
+        if doc_id not in DOCS:
+            return jsonify({"ok": False, "error": "doc not found"}), 404
+        data = request.get_json(force=True, silent=False) or {}
+        actions = data.get("actions", [])
+        if not actions:
+            return jsonify({"ok": True, "message": "nothing to do"})
+        pdf = fitz.open(stream=Storage.get(DOCS[doc_id]["working"]), filetype="pdf")
+
+        for a in actions:
+            t = a.get("type")
+            page = pdf[a["page"]]
+            page_rect = page.rect
+            viewport = a.get("viewport", {"w": page_rect.width, "h": page_rect.height})
+
+            if t in ("highlight", "strikeout", "shape_rect", "shape_circle", "textbox", "signature", "tick", "cross"):
+                rect = _scale_rect(a["rect"], page_rect, viewport)
+                rect = _ensure_min_rect(_clip_rect(rect, page_rect), page_rect, min_w=2.0, min_h=2.0)
+
+            if t == "highlight":
+                try:
+                    annot = page.add_highlight_annot(rect)
+                    annot.set_colors(stroke=_color_tuple(a.get("color")))
+                    if "opacity" in a: annot.set_opacity(float(a["opacity"]))
+                    annot.update()
+                except Exception:
+                    annot = page.add_rect_annot(rect)
+                    annot.set_colors(stroke=None, fill=_color_tuple(a.get("color")))
+                    annot.set_opacity(float(a.get("opacity", 0.35)))
+                    annot.update()
+
+            elif t == "strikeout":
+                try:
+                    annot = page.add_strikeout_annot(rect)
+                    annot.set_colors(stroke=_color_tuple(a.get("color")))
+                    if "opacity" in a: annot.set_opacity(float(a["opacity"]))
+                    annot.update()
+                except Exception:
+                    y = (rect.y0 + rect.y1) / 2
+                    p1 = fitz.Point(rect.x0, y); p2 = fitz.Point(rect.x1, y)
+                    annot = page.add_line_annot(p1, p2)
+                    annot.set_border(width=float(a.get("thickness", 2)))
+                    annot.set_colors(stroke=_color_tuple(a.get("color")))
+                    annot.update()
+
+            elif t == "shape_rect":
+                annot = page.add_rect_annot(rect)
+                annot.set_border(width=float(a.get("thickness", 2)))
+                annot.set_colors(stroke=_color_tuple(a.get("color")))
+                annot.update()
+
+            elif t == "shape_circle":
+                annot = page.add_circle_annot(rect)
+                annot.set_border(width=float(a.get("thickness", 2)))
+                annot.set_colors(stroke=_color_tuple(a.get("color")))
+                annot.update()
+
+            elif t in ("line", "arrow"):
+                p1 = _scale_point(a["points"][0], page_rect, viewport)
+                p2 = _scale_point(a["points"][1], page_rect, viewport)
+                if p1 == p2:
+                    p2 = fitz.Point(min(page_rect.x1, p2.x + 5), min(page_rect.y1, p2.y + 5))
+                annot = page.add_line_annot(p1, p2)
+                annot.set_border(width=float(a.get("thickness", 2)))
+                annot.set_colors(stroke=_color_tuple(a.get("color")))
+                if t == "arrow":
+                    try: annot.set_line_ends(("OpenArrow", "None"))
+                    except Exception: pass
+                annot.update()
+
+            elif t == "ink":
+                strokes = [[_scale_point(pt, page_rect, viewport) for pt in stroke] for stroke in a["points"]]
+                strokes = [s for s in strokes if len(s) > 1]
+                if not strokes: continue
+                annot = page.add_ink_annot(strokes)
+                annot.set_colors(stroke=_color_tuple(a.get("color")))
+                annot.set_border(width=float(a.get("thickness", 2)))
+                annot.update()
+
+            elif t == "textbox":
+                content = a.get("text", "")
+                font = a.get("font", "helv")
+                size = float(a.get("font_size", 14))
+
+                min_text_height = max(16.0, size * 1.6)
+                if rect.height < min_text_height:
+                    rect = fitz.Rect(rect.x0, rect.y0, rect.x1, min(page_rect.y1, rect.y0 + min_text_height))
+
+                text_rgb = _color_tuple(a.get("color", [0, 0, 0]))
+                # Use text_color when creating the annotation (avoid set_colors(text=...))
+                annot = page.add_freetext_annot(rect, content, fontsize=size, fontname=font, text_color=text_rgb)
+                annot.set_border(width=0)
+                annot.update()
+
+            elif t == "signature":
+                img_bytes = _decode_data_url(a.get("image_data_url"))
+                if img_bytes:
+                    page.insert_image(rect, stream=img_bytes, keep_proportion=True)
+
+            elif t == "tick":
+                x0,y0,x1,y1 = rect.x0, rect.y0, rect.x1, rect.y1
+                pA = fitz.Point(x0 + (x1-x0)*0.1, y0 + (y1-y0)*0.6)
+                pB = fitz.Point(x0 + (x1-x0)*0.4, y1 - (y1-y0)*0.1)
+                pC = fitz.Point(x1 - (x1-x0)*0.1, y0 + (y1-y0)*0.15)
+                annot = page.add_polyline_annot([pA,pB,pC])
+                annot.set_colors(stroke=_color_tuple(a.get("color")))
+                annot.set_border(width=float(a.get("thickness", 2)))
+                annot.update()
+
+            elif t == "cross":
+                p1 = fitz.Point(rect.x0, rect.y0); p2 = fitz.Point(rect.x1, rect.y1)
+                p3 = fitz.Point(rect.x1, rect.y0); p4 = fitz.Point(rect.x0, rect.y1)
+                ann1 = page.add_line_annot(p1, p2); ann2 = page.add_line_annot(p3, p4)
+                for ann in (ann1, ann2):
+                    ann.set_colors(stroke=_color_tuple(a.get("color")))
+                    ann.set_border(width=float(a.get("thickness", 2)))
+                    ann.update()
+
+        out = io.BytesIO()
+        pdf.save(out)
+        out.seek(0)
+        new_key = f"{doc_id}/{uuid.uuid4().hex}.pdf"
+        Storage.save(out.read(), new_key)
+        DOCS[doc_id]["working"] = new_key
+        DOCS[doc_id]["versions"].append(new_key)
+        return jsonify({"ok": True, "version": len(DOCS[doc_id]['versions'])})
+    except Exception as e:
+        app.logger.error("Annotate failed: %s\n%s", e, traceback.format_exc())
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+@app.post("/revert/<doc_id>")
+def revert(doc_id):
+    if doc_id not in DOCS:
+        return jsonify({"ok": False, "error": "doc not found"}), 404
+    vers = DOCS[doc_id]["versions"]
+    if len(vers) < 2:
+        return jsonify({"ok": False, "error": "no previous version"}), 400
+    vers.pop()
+    DOCS[doc_id]["working"] = vers[-1]
+    return jsonify({"ok": True, "version": len(vers)})
+
+@app.get("/download/<doc_id>")
+def download(doc_id):
+    if doc_id not in DOCS:
+        return jsonify({"error": "doc not found"}), 404
+    data = Storage.get(DOCS[doc_id]["working"])
+    return send_file(io.BytesIO(data), mimetype="application/pdf",
+                     as_attachment=True, download_name=DOCS[doc_id]["name"])
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+  port = int(os.environ.get("PORT", "8000"))
+  app.run(host="0.0.0.0", port=port, debug=False)

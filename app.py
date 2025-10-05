@@ -1,17 +1,14 @@
 # app.py — Mini PDF Editor (Flask + PyMuPDF)
-# Updates:
-#  • Signature flicker removed via image cache + requestAnimationFrame
-#  • Text Box font family + size controls (also apply to selected textbox)
-#  • New Tick / Cross tools (vector marks for checkboxes)
-#  • Selection: move/resize/edit; Delete key; Undo/Redo snapshots
-#  • Robust server JSON errors; highlight/strikeout fallbacks; rect/line guards
+# Adds: "How to use" page with inline SVG screenshots, Shortcuts page + modal.
+# Still includes: signature flicker fix, selection/move/resize/delete, text font/size,
+# tick/cross, undo/redo, JSON-only errors, min-rect guards, highlight/strike fallbacks.
 #
 # requirements.txt
 # Flask==3.0.3
 # python-dotenv==1.0.1
 # PyMuPDF==1.24.6
 # gunicorn==22.0.0
-# boto3==1.34.162    # only if USE_S3=true
+# boto3==1.34.162  # only if USE_S3=true
 
 import io, os, uuid, base64, traceback
 from datetime import datetime
@@ -137,15 +134,20 @@ INDEX_HTML = r"""
     .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background:#11162a; border:1px solid #2a355d; border-radius:6px; padding:1px 6px; }
     .card.bg-dark { background:#0f1428 !important; }
     label.small-label { font-size:.85rem; color:#aeb7d6; }
+    .brand { user-select:none }
   </style>
 </head>
 <body>
 <div class="container-fluid py-3">
-  <div class="d-flex align-items-center gap-3 mb-3">
-    <h3 class="m-0">Mini PDF Editor</h3>
+  <div class="d-flex align-items-center gap-2 mb-3">
+    <h3 class="m-0 brand">Mini PDF Editor</h3>
     <input id="file" type="file" class="form-control w-auto" accept="application/pdf" />
     <button id="btnDownload" class="btn btn-success">Download</button>
     <button id="btnUndoServer" class="btn btn-outline-warning">Rollback (server)</button>
+    <a href="/help" target="_blank" class="btn btn-outline-info">How to use</a>
+    <a href="/shortcuts" target="_blank" class="btn btn-outline-secondary">Shortcuts</a>
+    <button class="btn btn-info" data-bs-toggle="modal" data-bs-target="#helpModal">Quick help</button>
+    <button class="btn btn-secondary" data-bs-toggle="modal" data-bs-target="#shortcutsModal">Quick shortcuts</button>
   </div>
 
   <div class="row g-3">
@@ -165,7 +167,7 @@ INDEX_HTML = r"""
         <span class="kbd">I</span> Ink,
         <span class="kbd">T</span> Text,
         <span class="kbd">G</span> Signature
-        — Click annotations to move/resize. ⌫/Del = delete. Double-click a textbox to edit.
+        — Click an annotation to move/resize. ⌫/Del = delete. Double-click a textbox to edit.
       </div>
     </div>
 
@@ -234,6 +236,61 @@ INDEX_HTML = r"""
           <div class="ms-auto small text-secondary" id="sigStatus">Not set</div>
         </div>
         <div class="small text-secondary mt-2">After “Use Signature”, drag on the page to place it.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Quick Help Modal -->
+<div class="modal fade" id="helpModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content bg-dark text-light border-secondary">
+      <div class="modal-header">
+        <h5 class="modal-title">How to use</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <ol>
+          <li><strong>Upload</strong> a PDF with the file picker (top-left). Thumbnails appear on the left.</li>
+          <li>Click a <strong>thumbnail</strong> to switch pages. Use the <strong>Zoom</strong> slider if needed.</li>
+          <li>Choose a <strong>tool</strong> in the toolbar. Drag on the page to place it:
+            <ul>
+              <li><em>Highlight / Strikeout / Rect / Circle</em>: drag to create a box.</li>
+              <li><em>Line / Arrow</em>: drag from start to end.</li>
+              <li><em>Freehand</em>: click-drag to draw.</li>
+              <li><em>Text Box</em>: drag a box; type the text when prompted. Use <strong>Font</strong> and <strong>Size</strong> to style.</li>
+              <li><em>Signature</em>: click <strong>Signature</strong>, draw in the pad, “Use Signature”, then drag to place it.</li>
+              <li><em>Tick / Cross</em>: drag a small box over a checkbox.</li>
+            </ul>
+          </li>
+          <li><strong>Select & edit</strong>: Click any item to select. Drag inside to move. Drag corner handles to resize.
+              For lines/arrows, drag the endpoints. Double-click a textbox to edit its text.</li>
+          <li><strong>Delete</strong> selected item with the <kbd>Delete</kbd>/<kbd>Backspace</kbd> key.</li>
+          <li><strong>Undo/Redo</strong> with the buttons or <kbd>Ctrl/⌘+Z</kbd> / <kbd>Ctrl/⌘+Y</kbd>.</li>
+          <li>Click <strong>Save Edits</strong> to write changes into the PDF. Then <strong>Download</strong>.</li>
+          <li>If something goes wrong, use <strong>Rollback (server)</strong> to revert to the previous saved version.</li>
+        </ol>
+        <p class="small text-secondary m-0">A full page is available at <a href="/help" target="_blank">/help</a> and shortcuts at <a href="/shortcuts" target="_blank">/shortcuts</a>.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Quick Shortcuts Modal -->
+<div class="modal fade" id="shortcutsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content bg-dark text-light border-secondary">
+      <div class="modal-header">
+        <h5 class="modal-title">Keyboard shortcuts</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <ul class="mb-0">
+          <li><span class="kbd">H</span>/<span class="kbd">S</span>/<span class="kbd">R</span>/<span class="kbd">C</span>/<span class="kbd">L</span>/<span class="kbd">A</span>/<span class="kbd">I</span>/<span class="kbd">T</span>/<span class="kbd">G</span> — select tool</li>
+          <li><span class="kbd">Ctrl/⌘+Z</span> Undo, <span class="kbd">Ctrl/⌘+Y</span> Redo</li>
+          <li><span class="kbd">Delete</span>/<span class="kbd">Backspace</span> delete selected</li>
+          <li><span class="kbd">Esc</span> clear selection</li>
+        </ul>
       </div>
     </div>
   </div>
@@ -680,7 +737,7 @@ INDEX_HTML = r"""
     if (state.tool === 'tick') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'tick', rect };
     if (state.tool === 'cross') return (w < MIN_PIX || h < MIN_PIX) ? null : { ...base, type:'cross', rect };
     if (state.tool === 'line' || state.tool === 'arrow') {
-      if (dist(p1,p2) < MIN_PIX) return null;
+      if (Math.hypot(p2[0]-p1[0], p2[1]-p1[1]) < MIN_PIX) return null;
       return { ...base, type: state.tool, points: [p1, p2] };
     }
     return null;
@@ -708,10 +765,140 @@ INDEX_HTML = r"""
 </html>
 """
 
+# Help page with inline SVG “screenshots”
+HELP_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mini PDF Editor — How to use</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <style> body{background:#0b1020;color:#e7ecff} .card{background:#0f1428;border-color:#2a355d} .cap{color:#aeb7d6} </style>
+</head>
+<body class="p-4">
+  <div class="container">
+    <h2 class="mb-3">How to use the Mini PDF Editor</h2>
+
+    <ol class="mb-4">
+      <li class="mb-3">
+        <strong>Upload</strong> a PDF using the file picker.<br/>
+        <div class="card p-3 mt-2">
+          <div class="cap mb-2">Screenshot</div>
+          <!-- SVG: header with file chooser -->
+          <svg width="100%" height="80" viewBox="0 0 800 80">
+            <rect x="0" y="0" width="800" height="80" fill="#101425" stroke="#2a355d"/>
+            <rect x="10" y="20" width="180" height="36" rx="6" fill="#1a2140" stroke="#2a355d"/>
+            <text x="20" y="44" fill="#e7ecff" font-size="14">Choose File</text>
+            <rect x="200" y="20" width="140" height="36" rx="6" fill="#198754"/>
+            <text x="230" y="44" fill="#fff" font-size="14">Download</text>
+            <rect x="350" y="20" width="160" height="36" rx="6" fill="#0dcaf0"/>
+            <text x="390" y="44" fill="#001" font-size="14">How to use</text>
+          </svg>
+        </div>
+      </li>
+
+      <li class="mb-3">
+        Use the <strong>thumbnails</strong> on the left to navigate pages. Adjust <strong>Zoom</strong> as needed.<br/>
+        <div class="card p-3 mt-2">
+          <div class="cap mb-2">Screenshot</div>
+          <!-- SVG: thumbs left + page right -->
+          <svg width="100%" height="160" viewBox="0 0 800 160">
+            <rect x="0" y="0" width="800" height="160" fill="#101425" stroke="#2a355d"/>
+            <rect x="10" y="10" width="160" height="140" fill="#0f1428" stroke="#2a355d"/>
+            <rect x="20" y="20" width="140" height="30" fill="#1a2140"/>
+            <rect x="20" y="55" width="140" height="30" fill="#1a2140"/>
+            <rect x="20" y="90" width="140" height="30" fill="#1a2140"/>
+            <rect x="190" y="10" width="600" height="140" fill="#0f1428" stroke="#2a355d"/>
+            <rect x="210" y="20" width="560" height="120" fill="#11162a"/>
+          </svg>
+        </div>
+      </li>
+
+      <li class="mb-3">
+        Choose a <strong>tool</strong> and drag on the page to place it (Highlight, Strikeout, Rect, Circle, Line, Arrow, Ink, Text, Signature, Tick, Cross).<br/>
+        <div class="card p-3 mt-2">
+          <div class="cap mb-2">Screenshot</div>
+          <!-- SVG: toolbar chips -->
+          <svg width="100%" height="80" viewBox="0 0 800 80">
+            <rect x="0" y="0" width="800" height="80" fill="#101425" stroke="#2a355d"/>
+            <rect x="10" y="20" width="90" height="36" rx="18" fill="#f8f9fa"/><text x="22" y="43" fill="#000" font-size="13">Highlight</text>
+            <rect x="110" y="20" width="90" height="36" rx="18" fill="#f8f9fa"/><text x="122" y="43" fill="#000" font-size="13">Strikeout</text>
+            <rect x="210" y="20" width="70" height="36" rx="18" fill="#f8f9fa"/><text x="232" y="43" fill="#000" font-size="13">Rect</text>
+            <rect x="290" y="20" width="70" height="36" rx="18" fill="#f8f9fa"/><text x="312" y="43" fill="#000" font-size="13">Circle</text>
+            <rect x="370" y="20" width="65" height="36" rx="18" fill="#f8f9fa"/><text x="392" y="43" fill="#000" font-size="13">Line</text>
+            <rect x="440" y="20" width="75" height="36" rx="18" fill="#f8f9fa"/><text x="460" y="43" fill="#000" font-size="13">Arrow</text>
+            <rect x="520" y="20" width="85" height="36" rx="18" fill="#f8f9fa"/><text x="538" y="43" fill="#000" font-size="13">Freehand</text>
+          </svg>
+        </div>
+      </li>
+
+      <li class="mb-3">
+        <strong>Select & edit</strong>: Click an item to select (drag to move; drag corners to resize). Lines have draggable endpoints.
+        Double-click a textbox to edit text. Press <kbd>Delete</kbd> to remove an item.
+      </li>
+
+      <li class="mb-3">
+        Click <strong>Save Edits</strong> to write changes into the PDF. Then <strong>Download</strong> your file.
+      </li>
+
+      <li>
+        Need to go back? Use <strong>Rollback (server)</strong> to revert to the previous version saved on the server.
+      </li>
+    </ol>
+
+    <a href="/" class="btn btn-outline-light">Back to editor</a>
+    <a href="/shortcuts" class="btn btn-outline-secondary ms-2" target="_blank">Keyboard shortcuts</a>
+  </div>
+</body>
+</html>
+"""
+
+# Dedicated shortcuts page
+SHORTCUTS_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mini PDF Editor — Shortcuts</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <style> body{background:#0b1020;color:#e7ecff} .card{background:#0f1428;border-color:#2a355d} .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#11162a;border:1px solid #2a355d;border-radius:6px;padding:1px 6px} </style>
+</head>
+<body class="p-4">
+  <div class="container">
+    <h2 class="mb-3">Keyboard shortcuts</h2>
+    <div class="card p-3">
+      <table class="table table-dark table-sm align-middle mb-0">
+        <thead><tr><th>Action</th><th>Shortcut</th></tr></thead>
+        <tbody>
+          <tr><td>Select Highlight / Strikeout / Rect / Circle / Line / Arrow / Ink / Text / Signature</td>
+              <td><span class="kbd">H</span> / <span class="kbd">S</span> / <span class="kbd">R</span> / <span class="kbd">C</span> / <span class="kbd">L</span> / <span class="kbd">A</span> / <span class="kbd">I</span> / <span class="kbd">T</span> / <span class="kbd">G</span></td></tr>
+          <tr><td>Undo</td><td><span class="kbd">Ctrl</span>+<span class="kbd">Z</span> (or <span class="kbd">⌘</span>+<span class="kbd">Z</span>)</td></tr>
+          <tr><td>Redo</td><td><span class="kbd">Ctrl</span>+<span class="kbd">Y</span> (or <span class="kbd">⌘</span>+<span class="kbd">Y</span>)</td></tr>
+          <tr><td>Delete selected annotation</td><td><span class="kbd">Delete</span> / <span class="kbd">Backspace</span></td></tr>
+          <tr><td>Clear selection</td><td><span class="kbd">Esc</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <a href="/" class="btn btn-outline-light mt-3">Back to editor</a>
+  </div>
+</body>
+</html>
+"""
+
 # ───────── Routes ─────────
 @app.get("/")
 def index():
     return render_template_string(INDEX_HTML)
+
+@app.get("/help")
+def how_to():
+    return render_template_string(HELP_HTML)
+
+@app.get("/shortcuts")
+def shortcuts_page():
+    return render_template_string(SHORTCUTS_HTML)
 
 @app.post("/upload")
 def upload():
@@ -724,7 +911,13 @@ def upload():
     Storage.save(f.read(), original)
     working = f"{doc_id}/working.pdf"
     Storage.save(Storage.get(original), working)
-    DOCS[doc_id] = {"name": filename, "original": original, "working": working, "versions": [working], "created": datetime.utcnow().isoformat()}
+    DOCS[doc_id] = {
+        "name": filename,
+        "original": original,
+        "working": working,
+        "versions": [working],
+        "created": datetime.utcnow().isoformat(),
+    }
     return jsonify({"doc_id": doc_id})
 
 @app.get("/thumbs/<doc_id>")
@@ -825,8 +1018,8 @@ def annotate(doc_id):
                 annot.set_border(width=float(a.get("thickness", 2)))
                 annot.set_colors(stroke=_color_tuple(a.get("color")))
                 if t == "arrow":
-                  try: annot.set_line_ends(("OpenArrow", "None"))
-                  except Exception: pass
+                    try: annot.set_line_ends(("OpenArrow", "None"))
+                    except Exception: pass
                 annot.update()
 
             elif t == "ink":
@@ -854,7 +1047,6 @@ def annotate(doc_id):
                     page.insert_image(rect, stream=img_bytes, keep_proportion=True)
 
             elif t == "tick":
-                # create a V-shaped polyline inside rect
                 x0,y0,x1,y1 = rect.x0, rect.y0, rect.x1, rect.y1
                 pA = fitz.Point(x0 + (x1-x0)*0.1, y0 + (y1-y0)*0.6)
                 pB = fitz.Point(x0 + (x1-x0)*0.4, y1 - (y1-y0)*0.1)
@@ -865,7 +1057,6 @@ def annotate(doc_id):
                 annot.update()
 
             elif t == "cross":
-                # two crossing lines
                 p1 = fitz.Point(rect.x0, rect.y0); p2 = fitz.Point(rect.x1, rect.y1)
                 p3 = fitz.Point(rect.x1, rect.y0); p4 = fitz.Point(rect.x0, rect.y1)
                 ann1 = page.add_line_annot(p1, p2); ann2 = page.add_line_annot(p3, p4)

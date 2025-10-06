@@ -1,4 +1,4 @@
-# app.py — Mini PDF Editor (Flask + PyMuPDF)
+# app.py — OnePlacePDF (Flask + PyMuPDF)
 # Final: solid Undo/Redo, on-canvas Delete/Duplicate UI, textbox fixes, signature stability.
 #
 # requirements.txt
@@ -959,3 +959,4 @@ def health():
 if __name__ == "__main__":
   port = int(os.environ.get("PORT", "8000"))
   app.run(host="0.0.0.0", port=port, debug=False)
+

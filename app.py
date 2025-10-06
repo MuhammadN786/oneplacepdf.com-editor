@@ -144,7 +144,7 @@ INDEX_HTML = r"""
 <body>
 <div class="container-fluid py-3">
   <div class="d-flex align-items-center gap-2 mb-3">
-    <h3 class="m-0 brand">Mini PDF Editor</h3>
+    <h3 class="m-0 brand">OnePlacePDF</h3>
     <input id="file" type="file" class="form-control w-auto" accept="application/pdf" />
     <button id="btnDownload" class="btn btn-success">Download</button>
     <button id="btnUndoServer" class="btn btn-outline-warning">Rollback (server)</button>
@@ -959,5 +959,6 @@ def health():
 if __name__ == "__main__":
   port = int(os.environ.get("PORT", "8000"))
   app.run(host="0.0.0.0", port=port, debug=False)
+
 
 

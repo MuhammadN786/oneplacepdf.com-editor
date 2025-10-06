@@ -119,7 +119,7 @@ INDEX_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Mini PDF Editor</title>
+  <title>OnePlacePDF</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
   <style>
     body { background:#0b1020; color:#e7ecff; }
@@ -959,4 +959,5 @@ def health():
 if __name__ == "__main__":
   port = int(os.environ.get("PORT", "8000"))
   app.run(host="0.0.0.0", port=port, debug=False)
+
 
